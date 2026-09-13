@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PRISM // Tactical Command Center</title>
+
+  <!-- Three.js Core & Loaders -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/PLYLoader.js"></script>
+
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      font-family: 'Courier New', Courier, monospace;
+    }
+
+    body {
+      background-color: #08090c;
+      color: #c5c6c7;
+      height: 100vh;
+      width: 100vw;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* Top Bar Header */
+    .top-bar {
+      height: 48px;
+      background-color: #121820;
+      padding: 0 20px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      border-bottom: 2px solid #66fcf1;
+      flex-shrink: 0;
+    }
+
+    .top-bar h1 {
+      font-size: 1.1rem;
+      color: #66fcf1;
+      letter-spacing: 2px;
+    }
+
+    .status-indicator {
+      font-size: 0.85rem;
+      color: #66fcf1;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .dot {
+      height: 8px;
+      width: 8px;
+      background-color: #66fcf1;
+      border-radius: 50%;
+      animation: blinker 1.4s linear infinite;
+    }
+
+    @keyframes blinker {
+      50% {
+        opacity: 0.1;
+      }
+    }
+
+    /* Main Single-Screen Grid Layout */
+    .dashboard-grid {
+      display: grid;
+      grid-template-columns: 360px 1fr;
+      gap: 12px;
+      padding: 12px;
+      height: calc(100vh - 48px);
+      overflow: hidden;
+    }
+
+    .panel {
+      background-color: #121820;
+      border: 1px solid #1f2833;
+      border-radius: 4px;
+      padding: 12px;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    .panel h2 {
+      font-size: 0.9rem;
+      color: #66fcf1;
+      letter-spacing: 1.5px;
+      margin-bottom: 8px;
+      border-bottom: 1px solid #233544;
+      padding-bottom: 4px;
+      flex-shrink: 0;
+    }
+
+    /* Left Side: Compact Video & Controls */
+    .video-column {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      height: 100%;
+      min-height: 0;
+      /* Prevents column from overflowing */
+    }
+
+    .video-panel {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      min-height: 0;
+      /* Forces video panel to shrink to fit */
+    }
+
+    .video-wrapper {
+      flex: 1;
+      background-color: #000;
+      border: 1px solid #233544;
+      border-radius: 3px;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      overflow: hidden;
+      min-height: 0;
+    }
+
+    #uav-video {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+    }
+
+    /* Telemetry Readout Box */
+    .telemetry-panel {
+      flex-shrink: 0;
+    }
+
+    .telemetry-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      background-color: #050608;
+      border: 1px solid #233544;
+      padding: 10px;
+      border-radius: 3px;
+    }
+
+    .telemetry-grid p {
+      font-size: 0.8rem;
+      color: #8c9ba5;
+    }
+
+    .telemetry-grid span {
+      color: #66fcf1;
+      font-weight: bold;
+    }
+
+    /* Right Side: 3D Tactical Canvas */
+    .twin-panel {
+      display: flex;
+      flex-direction: column;
+      height: 100%;
+      position: relative;
+    }
+
+    #canvas-container {
+      flex: 1;
+      width: 100%;
+      height: 100%;
+      background-color: #050608;
+      border: 1px solid #233544;
+      border-radius: 3px;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .hud-overlay {
+      position: absolute;
+      top: 40px;
+      right: 20px;
+      background: rgba(18, 24, 32, 0.8);
+      border: 1px solid #233544;
+      padding: 8px 12px;
+      font-size: 0.75rem;
+      color: #66fcf1;
+      border-radius: 3px;
+      pointer-events: none;
+    }
+  </style>
+</head>
+
+<body>
+  <header class="top-bar">
+    <h1>PRISM // TACTICAL RECON COMMAND</h1>
+    <div class="status-indicator">
+      <span class="dot"></span> TELEMETRY ACTIVE
+    </div>
+  </header>
+
+  <main class="dashboard-grid">
+    <!-- Left Side: UAV Stream + Telemetry Box -->
+    <div class="video-column">
+      <section class="panel video-panel">
+        <h2>LIVE UAV STREAM [CAM-01]</h2>
+        <div class="video-wrapper">
+          <video id="uav-video" controls autoplay muted loop>
+            <source src="http://127.0.0.1:8000/data/raw_videos/drone_flight.mp4" type="video/mp4">
+            Your browser does not support HTML5 video.
+          </video>
+        </div>
+      </section>
+
+      <section class="panel telemetry-panel">
+        <h2>METRIC TELEMETRY</h2>
+        <div class="telemetry-grid">
+          <p>LAT: <span id="lat-val">--</span></p>
+          <p>LON: <span id="lon-val">--</span></p>
+          <p>ALT: <span id="alt-val">--</span> m</p>
+          <p>DIST: <span id="dist-val">--</span> m</p>
+        </div>
+      </section>
+    </div>
+
+    <!-- Right Side: 3D Scene Viewport -->
+    <section class="panel twin-panel">
+      <h2>3D TACTICAL DIGITAL TWIN (RECON VIEW)</h2>
+      <div id="canvas-container">
+        <!-- TACTICAL MEASUREMENT HUD OVERLAY -->
+        <div class="tactical-readout-box">
+          <span class="readout-label">MEASUREMENT INTEL (M to arm)</span>
+          <div id="measure-readout">STANDBY</div>
+        </div>
+      </div>
+      <div class="hud-overlay">
+        MODE: 3DGS ORBIT | DRAG: ROTATE | SCROLL: ZOOM
+      </div>
+    </section>
+  </main>
+
+  <script src="js/viewer.js"></script>
+</body>
+
+</html>

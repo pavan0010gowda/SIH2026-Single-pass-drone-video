@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+.ruff_cache/
+.pytest_cache/
+.venv/
+venv/
+.env
+
+# Editors
+.vscode/
+.idea/
+
+# Runtime data: uploaded videos, COLMAP workspaces, models, baselines, exports.
+# The server creates these folders on start.
+data/
+
+# Large binaries (YOLO weights download automatically on first use)
+*.pt
+*.mp4
+*.MP4
+*.mov
+*.MOV
+*.ply
+*.las
+*.laz
+*.tif
+*.tiff
+*.glb
+*.zip
+*.db
+
+# Local backups
+backups/
