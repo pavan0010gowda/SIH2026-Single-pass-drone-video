@@ -1,6 +1,10 @@
 import os
+import sys
 import numpy as np
-import open3d as o3d
+try:
+    import open3d as o3d
+except ImportError:
+    o3d = None
 from scipy.spatial import cKDTree
 
 def detect_3d_changes(baseline_ply, new_ply, output_ply, distance_threshold=0.5):
@@ -8,6 +12,10 @@ def detect_3d_changes(baseline_ply, new_ply, output_ply, distance_threshold=0.5)
     Compares two 3D point clouds. Any points in 'new_ply' that are further than 
     'distance_threshold' (in meters) from 'baseline_ply' are flagged as new structures.
     """
+    if o3d is None:
+        print("Error: Open3D is required for diff_engine.")
+        return
+
     print(f"Loading Baseline Scan: {baseline_ply}")
     pcd_base = o3d.io.read_point_cloud(baseline_ply)
     
