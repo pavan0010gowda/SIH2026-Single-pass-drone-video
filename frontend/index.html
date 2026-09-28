@@ -1,2261 +1,311 @@
 <!DOCTYPE html>
 <html lang="en">
-
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>PRISM // Tactical Recon Command (SIH-NTRO)</title>
-
-  <!-- Modern Clean Typography: Inter for UI & JetBrains Mono for telemetry -->
+  <title>PRISM · Survey Intelligence</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-
-  <!-- Three.js Core & Loaders -->
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="css/styles.css">
   <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/PLYLoader.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/OBJLoader.js"></script>
-
-  <style>
-    :root {
-      --bg-dark: #0b0f17;
-      --panel-bg: #111827;
-      --panel-border: #1f2937;
-      --accent-blue: #3b82f6;
-      --accent-cyan: #38bdf8;
-      --accent-green: #10b981;
-      --accent-amber: #f59e0b;
-      --accent-red: #ef4444;
-      --text-main: #f1f5f9;
-      --text-muted: #94a3b8;
-      --font-display: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      --font-mono: 'JetBrains Mono', Consolas, monospace;
-    }
-
-    * {
-      box-sizing: border-box;
-      margin: 0;
-      padding: 0;
-    }
-
-    body {
-      background-color: var(--bg-dark);
-      color: var(--text-main);
-      font-family: var(--font-display);
-      height: 100vh;
-      width: 100vw;
-      overflow: hidden;
-      display: flex;
-      flex-direction: column;
-      user-select: none;
-      -webkit-font-smoothing: antialiased;
-    }
-
-    button, input, select, textarea {
-      font-family: var(--font-display);
-    }
-      user-select: none;
-    }
-
-    /* Top Bar Header (Desktop / IDE Menu Bar Style) */
-    .top-bar {
-      height: 42px;
-      background: #161b22;
-      padding: 0 16px;
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      border-bottom: 1px solid var(--panel-border);
-      flex-shrink: 0;
-      z-index: 100;
-    }
-
-    .top-left {
-      display: flex;
-      align-items: center;
-      gap: 16px;
-    }
-
-    .brand-group {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-    }
-
-    .brand-title {
-      font-family: var(--font-display);
-      font-size: 0.95rem;
-      font-weight: 700;
-      color: #fff;
-      letter-spacing: 0.5px;
-    }
-
-    .brand-title span {
-      color: var(--accent-blue);
-      font-weight: 600;
-    }
-
-    .sub-badge {
-      font-size: 0.65rem;
-      background: rgba(88, 166, 255, 0.12);
-      border: 1px solid rgba(88, 166, 255, 0.3);
-      color: var(--accent-blue);
-      padding: 1px 6px;
-      border-radius: 3px;
-      letter-spacing: 0.5px;
-    }
-
-    /* Desktop Menu Bar (Antigravity IDE style) */
-    .menu-bar {
-      display: flex;
-      align-items: center;
-      gap: 2px;
-    }
-
-    .menu-item-wrapper {
-      position: relative;
-    }
-
-    .menu-btn {
-      background: transparent;
-      border: 1px solid transparent;
-      color: var(--text-main);
-      font-family: var(--font-display);
-      font-size: 0.8rem;
-      font-weight: 500;
-      padding: 4px 10px;
-      border-radius: 4px;
-      cursor: pointer;
-      transition: all 0.15s ease;
-    }
-
-    .menu-btn:hover, .menu-btn.active {
-      background: #1f2937;
-      color: #fff;
-      border-color: #374151;
-    }
-
-    .dropdown-menu {
-      position: absolute;
-      top: calc(100% + 4px);
-      left: 0;
-      min-width: 240px;
-      background: #161b22;
-      border: 1px solid #30363d;
-      border-radius: 6px;
-      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.55);
-      padding: 4px 0;
-      display: none;
-      flex-direction: column;
-      z-index: 1000;
-      animation: modal-fade-in 0.12s ease-out;
-    }
-
-    .dropdown-menu.show {
-      display: flex;
-    }
-
-    .dropdown-item {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 7px 12px;
-      color: #c9d1d9;
-      font-size: 0.75rem;
-      cursor: pointer;
-      background: transparent;
-      border: none;
-      width: 100%;
-      text-align: left;
-      transition: background 0.1s ease;
-    }
-
-    .dropdown-item:hover {
-      background: #1f6feb;
-      color: #fff;
-    }
-
-    .dropdown-item.active {
-      color: var(--accent-blue);
-      font-weight: 600;
-    }
-
-    .dropdown-item:hover.active {
-      color: #fff;
-    }
-
-    .dropdown-item .shortcut {
-      color: #8b949e;
-      font-size: 0.68rem;
-      margin-left: 16px;
-    }
-
-    .dropdown-item:hover .shortcut {
-      color: rgba(255, 255, 255, 0.8);
-    }
-
-    .menu-check {
-      color: var(--accent-blue);
-      font-weight: 700;
-      font-size: 0.8rem;
-    }
-
-    .dropdown-item:hover .menu-check {
-      color: #fff;
-    }
-
-    .dropdown-divider {
-      height: 1px;
-      background: #30363d;
-      margin: 4px 0;
-    }
-
-    .top-actions {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-    }
-
-    .status-badge {
-      font-size: 0.72rem;
-      display: flex;
-      align-items: center;
-      gap: 6px;
-      padding: 3px 8px;
-      border-radius: 4px;
-      background: #21262d;
-      border: 1px solid var(--panel-border);
-      color: var(--text-muted);
-    }
-
-    .status-badge.active {
-      border-color: rgba(63, 185, 80, 0.4);
-      color: var(--accent-green);
-    }
-
-    .status-badge.running {
-      border-color: rgba(210, 153, 34, 0.4);
-      color: var(--accent-amber);
-    }
-
-    .dot {
-      height: 6px;
-      width: 6px;
-      background-color: var(--accent-green);
-      border-radius: 50%;
-    }
-
-    .dot.running {
-      background-color: var(--accent-amber);
-      animation: blinker 1s infinite;
-    }
-
-    @keyframes blinker {
-      50% { opacity: 0.2; }
-    }
-
-    /* Clean Buttons */
-    .btn-clean {
-      background: #1f2937;
-      border: 1px solid #374151;
-      color: #e2e8f0;
-      padding: 5px 12px;
-      font-size: 0.78rem;
-      font-family: var(--font-display);
-      font-weight: 500;
-      cursor: pointer;
-      border-radius: 4px;
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      transition: all 0.15s ease;
-    }
-
-    .btn-clean:hover {
-      background: #374151;
-      color: #fff;
-      border-color: #4b5563;
-    }
-
-    .btn-tactical {
-      background: #2563eb;
-      border: 1px solid rgba(255, 255, 255, 0.1);
-      color: #fff;
-      padding: 6px 14px;
-      font-size: 0.8rem;
-      font-family: var(--font-display);
-      font-weight: 600;
-      cursor: pointer;
-      border-radius: 4px;
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      transition: all 0.15s ease;
-    }
-
-    .btn-tactical:hover {
-      background: #1d4ed8;
-    }
-
-    .btn-tactical.btn-danger {
-      background: rgba(248, 81, 73, 0.15);
-      border-color: rgba(248, 81, 73, 0.4);
-      color: #f85149;
-    }
-
-    .btn-tactical.btn-danger:hover {
-      background: #da3633;
-      color: #fff;
-    }
-
-    /* Main Dashboard Layout */
-    .dashboard-grid {
-      display: grid;
-      grid-template-columns: 360px 1fr;
-      gap: 10px;
-      padding: 10px;
-      height: calc(100vh - 42px - 24px);
-      overflow: hidden;
-    }
-
-    .panel {
-      background-color: var(--panel-bg);
-      border: 1px solid var(--panel-border);
-      border-radius: 6px;
-      padding: 10px 12px;
-      display: flex;
-      flex-direction: column;
-      overflow: hidden;
-      position: relative;
-    }
-
-    .panel-header {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      margin-bottom: 8px;
-      border-bottom: 1px solid var(--panel-border);
-      padding-bottom: 6px;
-      flex-shrink: 0;
-    }
-
-    .panel-header h2 {
-      font-family: var(--font-display);
-      font-size: 0.82rem;
-      font-weight: 600;
-      color: var(--text-main);
-      letter-spacing: 0.5px;
-    }
-
-    .panel-tag {
-      font-size: 0.65rem;
-      color: var(--text-muted);
-      background: #21262d;
-      padding: 2px 6px;
-      border-radius: 3px;
-      border: 1px solid #30363d;
-    }
-
-    /* Left Side: Compact Video & Controls */
-    .video-column {
-      display: flex;
-      flex-direction: column;
-      gap: 10px;
-      height: 100%;
-      min-height: 0;
-    }
-
-    .video-panel {
-      flex: 1;
-      display: flex;
-      flex-direction: column;
-      overflow: hidden;
-      min-height: 0;
-    }
-
-    .video-wrapper {
-      flex: 1;
-      background-color: #000;
-      border: 1px solid var(--panel-border);
-      border-radius: 4px;
-      display: flex;
-      justify-content: center;
-      align-items: center;
-      overflow: hidden;
-      min-height: 0;
-      position: relative;
-    }
-
-    #uav-video {
-      width: 100%;
-      height: 100%;
-      object-fit: contain;
-    }
-
-    .cam-watermark {
-      position: absolute;
-      top: 8px;
-      left: 8px;
-      font-size: 0.68rem;
-      color: var(--text-muted);
-      background: rgba(11, 15, 23, 0.85);
-      padding: 3px 8px;
-      border-radius: 4px;
-      pointer-events: none;
-      border: 1px solid var(--panel-border);
-      display: flex;
-      align-items: center;
-      gap: 6px;
-    }
-
-    .cam-watermark .rec-dot {
-      width: 6px;
-      height: 6px;
-      border-radius: 50%;
-      background: var(--accent-red);
-    }
-
-    /* Telemetry Readout Box */
-    .telemetry-panel {
-      flex-shrink: 0;
-    }
-
-    .telemetry-grid {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 6px;
-      background-color: #0d1117;
-      border: 1px solid var(--panel-border);
-      padding: 8px;
-      border-radius: 4px;
-    }
-
-    .telemetry-item {
-      display: flex;
-      flex-direction: column;
-      background: #161b22;
-      padding: 6px 8px;
-      border-left: 2px solid var(--accent-blue);
-      border-radius: 0 3px 3px 0;
-    }
-
-    .telemetry-item span.label {
-      font-size: 0.62rem;
-      color: var(--text-muted);
-      letter-spacing: 0.5px;
-    }
-
-    .telemetry-item span.val {
-      font-size: 0.88rem;
-      color: var(--text-main);
-      font-weight: 600;
-      margin-top: 1px;
-    }
-
-    /* Right Side: 3D Tactical Canvas */
-    .twin-panel {
-      display: flex;
-      flex-direction: column;
-      height: 100%;
-      position: relative;
-    }
-
-    #canvas-container {
-      flex: 1;
-      width: 100%;
-      height: 100%;
-      background-color: #07090e;
-      border: 1px solid var(--panel-border);
-      border-radius: 4px;
-      position: relative;
-      overflow: hidden;
-    }
-
-    /* Desktop Bottom Status Bar */
-    .app-status-bar {
-      height: 24px;
-      background: #161b22;
-      border-top: 1px solid var(--panel-border);
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      padding: 0 12px;
-      font-size: 0.68rem;
-      color: var(--text-muted);
-      flex-shrink: 0;
-      z-index: 90;
-    }
-
-    .status-left, .status-right {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-    }
-
-    .status-pill {
-      display: flex;
-      align-items: center;
-      gap: 5px;
-      color: var(--accent-green);
-      font-weight: 500;
-    }
-
-    .status-dot {
-      width: 6px;
-      height: 6px;
-      border-radius: 50%;
-      background: var(--accent-green);
-    }
-
-    .status-sep {
-      color: #30363d;
-    }
-
-    .app-status-bar kbd {
-      background: #21262d;
-      border: 1px solid #30363d;
-      padding: 1px 4px;
-      border-radius: 3px;
-      color: #c9d1d9;
-      font-size: 0.62rem;
-    }
-
-    /* Measurement HUD Overlay - Clean Understated Card */
-    .tactical-readout-box {
-      position: absolute;
-      bottom: 14px;
-      right: 14px;
-      background: rgba(17, 24, 39, 0.9);
-      border: 1px solid var(--panel-border);
-      border-radius: 6px;
-      padding: 10px 14px;
-      color: var(--text-main);
-      z-index: 50;
-      pointer-events: none;
-      box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
-      min-width: 160px;
-      backdrop-filter: blur(8px);
-    }
-
-    .readout-label {
-      font-size: 0.68rem;
-      color: var(--text-muted);
-      display: block;
-      margin-bottom: 6px;
-      border-bottom: 1px solid var(--panel-border);
-      padding-bottom: 3px;
-      letter-spacing: 0.5px;
-      font-weight: 600;
-      text-transform: uppercase;
-    }
-
-    #measure-readout {
-      font-size: 0.82rem;
-      line-height: 1.4;
-      font-weight: 500;
-      font-family: var(--font-mono);
-      color: #fff;
-    }
-
-    /* =================================================================
-       TACTICAL INGESTION & PIPELINE MODAL
-       ================================================================= */
-    .modal-backdrop {
-      position: fixed;
-      top: 0;
-      left: 0;
-      width: 100vw;
-      height: 100vh;
-      background: rgba(4, 6, 10, 0.85);
-      backdrop-filter: blur(8px);
-      display: none;
-      justify-content: center;
-      align-items: center;
-      z-index: 1000;
-    }
-
-    .modal-backdrop.active {
-      display: flex;
-    }
-
-    .tactical-modal {
-      width: 680px;
-      max-width: 92vw;
-      max-height: 90vh;
-      background: #161b22;
-      border: 1px solid var(--panel-border);
-      box-shadow: 0 16px 40px rgba(0, 0, 0, 0.7);
-      border-radius: 6px;
-      display: flex;
-      flex-direction: column;
-      overflow: hidden;
-      animation: modal-fade-in 0.18s ease-out;
-    }
-
-    @keyframes modal-fade-in {
-      from { opacity: 0; transform: scale(0.98) translateY(-6px); }
-      to { opacity: 1; transform: scale(1) translateY(0); }
-    }
-
-    .modal-header {
-      padding: 12px 18px;
-      background: #1c2128;
-      border-bottom: 1px solid var(--panel-border);
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-    }
-
-    .modal-title-group h3 {
-      font-family: var(--font-display);
-      font-size: 0.95rem;
-      font-weight: 600;
-      color: #f0f6fc;
-      letter-spacing: 0.5px;
-    }
-
-    .modal-title-group p {
-      font-size: 0.7rem;
-      color: var(--text-muted);
-      margin-top: 2px;
-    }
-
-    .modal-close-btn {
-      background: transparent;
-      border: none;
-      color: var(--text-muted);
-      font-size: 1.4rem;
-      cursor: pointer;
-      line-height: 1;
-      padding: 4px;
-      transition: color 0.2s;
-    }
-
-    .modal-close-btn:hover {
-      color: var(--accent-red);
-    }
-
-    .modal-body {
-      padding: 20px;
-      overflow-y: auto;
-      display: flex;
-      flex-direction: column;
-      gap: 18px;
-    }
-
-    /* Option Row: Mode / Coordinates / Preset */
-    .option-group {
-      display: flex;
-      flex-direction: column;
-      gap: 8px;
-    }
-
-    .option-label {
-      font-size: 0.75rem;
-      color: var(--text-muted);
-      letter-spacing: 1px;
-      text-transform: uppercase;
-      display: flex;
-      justify-content: space-between;
-    }
-
-    .option-pills {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 10px;
-    }
-
-    .option-pills.tri {
-      grid-template-columns: 1fr 1fr 1fr;
-    }
-
-    .option-pills.quad {
-      grid-template-columns: 1fr 1fr 1fr 1fr;
-    }
-
-    @media (max-width: 900px) {
-      .option-pills.quad {
-        grid-template-columns: 1fr 1fr;
-      }
-    }
-
-    .view-btn {
-      background: transparent;
-      border: 1px solid transparent;
-      color: var(--text-muted);
-      font-family: var(--font-display);
-      font-size: 0.75rem;
-      padding: 4px 10px;
-      border-radius: 4px;
-      cursor: pointer;
-      transition: all 0.15s ease;
-      white-space: nowrap;
-    }
-
-    .view-btn:hover {
-      color: #fff;
-      border-color: #374151;
-      background: #1f2937;
-    }
-
-    .view-btn.active {
-      background: #2563eb;
-      color: #fff;
-      font-weight: 600;
-      border-color: #3b82f6;
-      box-shadow: none;
-    }
-
-    .btn-compact {
-      padding: 4px 10px;
-      font-size: 0.72rem;
-      letter-spacing: 0.8px;
-    }
-
-    .pill-btn {
-      background: #0b0f17;
-      border: 1px solid var(--panel-border);
-      color: var(--text-muted);
-      padding: 10px 14px;
-      border-radius: 6px;
-      cursor: pointer;
-      font-size: 0.78rem;
-      display: flex;
-      flex-direction: column;
-      align-items: flex-start;
-      gap: 3px;
-      transition: all 0.15s ease;
-      text-align: left;
-    }
-
-    .pill-btn strong {
-      font-family: var(--font-display);
-      color: var(--text-main);
-      font-size: 0.82rem;
-      letter-spacing: 0.2px;
-      font-weight: 600;
-    }
-
-    .pill-btn span.sub {
-      font-size: 0.7rem;
-      color: var(--text-muted);
-    }
-
-    .pill-btn:hover {
-      border-color: #4b5563;
-      background: #111827;
-    }
-
-    .pill-btn.active {
-      background: rgba(59, 130, 246, 0.12);
-      border-color: #3b82f6;
-      color: #60a5fa;
-    }
-
-    .pill-btn.active strong {
-      color: #60a5fa;
-    }
-
-    /* Dropzone */
-    .dropzone-container {
-      display: flex;
-      flex-direction: column;
-      gap: 10px;
-    }
-
-    .dropzone {
-      border: 1px dashed var(--panel-border);
-      border-radius: 6px;
-      padding: 22px 18px;
-      background: #0b0f17;
-      text-align: center;
-      cursor: pointer;
-      transition: all 0.15s ease;
-      position: relative;
-    }
-
-    .dropzone:hover, .dropzone.dragover {
-      border-color: var(--accent-blue);
-      background: #111827;
-    }
-
-    .dropzone-icon-svg {
-      margin-bottom: 8px;
-      color: #3b82f6;
-    }
-
-    .dropzone-title {
-      font-size: 0.82rem;
-      color: var(--text-main);
-      font-family: var(--font-display);
-      margin-bottom: 4px;
-      font-weight: 600;
-    }
-
-    .dropzone-sub {
-      font-size: 0.72rem;
-      color: var(--text-muted);
-    }
-
-    .file-badge {
-      display: none;
-      margin-top: 10px;
-      background: rgba(88, 166, 255, 0.1);
-      border: 1px solid var(--accent-blue);
-      padding: 6px 12px;
-      border-radius: 3px;
-      font-size: 0.75rem;
-      color: var(--accent-blue);
-      align-items: center;
-      justify-content: space-between;
-    }
-
-    .file-badge.visible {
-      display: flex;
-    }
-
-    /* Live Pipeline Monitor Box */
-    .pipeline-monitor {
-      display: none;
-      background: #0d1117;
-      border: 1px solid var(--panel-border);
-      border-radius: 4px;
-      padding: 14px;
-      flex-direction: column;
-      gap: 10px;
-    }
-
-    .pipeline-monitor.active {
-      display: flex;
-    }
-
-    .monitor-header {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-    }
-
-    .monitor-stage-title {
-      font-family: var(--font-display);
-      font-size: 0.85rem;
-      color: var(--accent-amber);
-      display: flex;
-      align-items: center;
-      gap: 8px;
-    }
-
-    .monitor-timer {
-      font-size: 0.75rem;
-      color: var(--text-muted);
-    }
-
-    .progress-bar-track {
-      width: 100%;
-      height: 6px;
-      background: #161b22;
-      border-radius: 3px;
-      overflow: hidden;
-      border: 1px solid var(--panel-border);
-      position: relative;
-    }
-
-    .progress-bar-fill {
-      height: 100%;
-      width: 0%;
-      background: var(--accent-blue);
-      transition: width 0.3s ease;
-    }
-
-    .terminal-console {
-      height: 120px;
-      background: #0b0f17;
-      border: 1px solid var(--panel-border);
-      border-radius: 4px;
-      padding: 10px 12px;
-      overflow-y: auto;
-      font-size: 0.72rem;
-      line-height: 1.45;
-      color: #c9d1d9;
-      font-family: var(--font-mono);
-      white-space: pre-wrap;
-      word-break: break-all;
-    }
-
-    .terminal-console::-webkit-scrollbar {
-      width: 5px;
-    }
-
-    .terminal-console::-webkit-scrollbar-thumb {
-      background: #21262d;
-      border-radius: 3px;
-    }
-
-    .modal-footer {
-      padding: 12px 18px;
-      background: #161b22;
-      border-top: 1px solid var(--panel-border);
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-    }
-
-    .footer-left {
-      font-size: 0.7rem;
-      color: var(--text-muted);
-    }
-
-    /* Toast Notification */
-    .tactical-toast {
-      position: fixed;
-      top: 52px;
-      right: 20px;
-      background: #161b22;
-      border: 1px solid var(--panel-border);
-      color: #f0f6fc;
-      padding: 9px 16px;
-      border-radius: 6px;
-      font-size: 0.78rem;
-      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.6);
-      z-index: 2000;
-      opacity: 0;
-      transform: translateY(-8px);
-      transition: all 0.2s ease;
-      pointer-events: none;
-    }
-
-    /* Tactical Diff & Baseline Alert Drawer */
-    .diff-alert-drawer {
-      position: absolute;
-      top: 12px;
-      left: 12px;
-      width: 320px;
-      max-height: calc(100% - 24px);
-      background: #161b22;
-      border: 1px solid var(--panel-border);
-      border-left: 3px solid var(--accent-red);
-      border-radius: 6px;
-      box-shadow: 0 12px 32px rgba(0, 0, 0, 0.65);
-      z-index: 60;
-      display: none;
-      flex-direction: column;
-      animation: modal-fade-in 0.15s ease-out;
-    }
-
-    .diff-alert-drawer.active {
-      display: flex;
-    }
-
-    .alert-drawer-header {
-      padding: 9px 12px;
-      background: #1c2128;
-      border-bottom: 1px solid var(--panel-border);
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-    }
-
-    .alert-drawer-title {
-      font-family: var(--font-display);
-      font-size: 0.82rem;
-      font-weight: 600;
-      color: var(--accent-red);
-      letter-spacing: 0.5px;
-      display: flex;
-      align-items: center;
-      gap: 6px;
-    }
-
-    .alert-count-pill {
-      background: var(--accent-red);
-      color: #fff;
-      font-size: 0.62rem;
-      padding: 1px 6px;
-      border-radius: 10px;
-      font-weight: 700;
-    }
-
-    .alert-summary-bar {
-      padding: 6px 12px;
-      background: #0d1117;
-      font-size: 0.68rem;
-      color: var(--text-muted);
-      border-bottom: 1px solid var(--panel-border);
-      display: flex;
-      justify-content: space-between;
-    }
-
-    .alert-list {
-      overflow-y: auto;
-      padding: 8px;
-      display: flex;
-      flex-direction: column;
-      gap: 8px;
-      max-height: 380px;
-    }
-
-    .alert-card {
-      background: #0d1117;
-      border: 1px solid var(--panel-border);
-      border-radius: 4px;
-      padding: 8px 10px;
-      cursor: pointer;
-      transition: all 0.15s ease;
-      display: flex;
-      flex-direction: column;
-      gap: 4px;
-    }
-
-    .alert-card:hover {
-      border-color: var(--accent-red);
-      background: #1c2128;
-    }
-
-    .alert-card-top {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-    }
-
-    .alert-id {
-      font-family: var(--font-display);
-      font-size: 0.78rem;
-      font-weight: 700;
-      color: var(--accent-red);
-    }
-
-    .alert-threat-badge {
-      font-size: 0.62rem;
-      padding: 1px 5px;
-      border-radius: 2px;
-      font-weight: 700;
-      letter-spacing: 0.5px;
-    }
-
-    .threat-HIGH { background: rgba(248, 81, 73, 0.2); color: #f85149; border: 1px solid rgba(248, 81, 73, 0.4); }
-    .threat-ELEVATED { background: rgba(210, 153, 34, 0.2); color: #d29922; border: 1px solid rgba(210, 153, 34, 0.4); }
-    .threat-ADVISORY { background: rgba(88, 166, 255, 0.2); color: #58a6ff; border: 1px solid rgba(88, 166, 255, 0.4); }
-
-    .alert-desc {
-      font-size: 0.72rem;
-      color: #e2e8f0;
-      font-weight: 600;
-    }
-
-    .alert-meta-grid {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 4px;
-      font-size: 0.65rem;
-      color: var(--text-muted);
-      margin-top: 2px;
-      background: #161b22;
-      padding: 4px 6px;
-      border-radius: 3px;
-    }
-
-    .alert-meta-grid b {
-      color: var(--accent-blue);
-    }
-
-    .disjoint-box {
-      background: rgba(210, 153, 34, 0.12);
-      border: 1px solid var(--accent-amber);
-      border-radius: 4px;
-      padding: 12px;
-      color: #e3b341;
-      font-size: 0.78rem;
-      line-height: 1.4;
-      display: none;
-      flex-direction: column;
-      gap: 6px;
-    }
-
-    .disjoint-box.active {
-      display: flex;
-    }
-
-    .baseline-list-box {
-      display: flex;
-      flex-direction: column;
-      gap: 8px;
-      max-height: 220px;
-      overflow-y: auto;
-    }
-
-    .baseline-card {
-      background: #0d1117;
-      border: 1px solid var(--panel-border);
-      border-radius: 4px;
-      padding: 9px 12px;
-      cursor: pointer;
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      transition: all 0.15s ease;
-    }
-
-    .baseline-card:hover {
-      border-color: #8b949e;
-      background: #161b22;
-    }
-
-    .baseline-card.selected {
-      border-color: var(--accent-blue);
-      background: rgba(88, 166, 255, 0.12);
-    }
-
-    /* Baseline delete button */
-    .btn-baseline-delete {
-      background: #161b22;
-      border: 1px solid var(--panel-border);
-      border-radius: 4px;
-      color: #8b949e;
-      padding: 5px 7px;
-      cursor: pointer;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      transition: all 0.15s ease;
-    }
-
-    .btn-baseline-delete:hover {
-      color: #ef4444;
-      border-color: rgba(239, 68, 68, 0.4);
-      background: rgba(239, 68, 68, 0.15);
-    }
-
-    /* BRO Road & Pothole Styles */
-    .pothole-audit-drawer {
-      position: absolute;
-      top: 12px;
-      right: 12px;
-      width: 320px;
-      max-height: calc(100% - 24px);
-      background: rgba(13, 17, 23, 0.94);
-      border: 1px solid rgba(88, 166, 255, 0.35);
-      border-radius: 6px;
-      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.6);
-      backdrop-filter: blur(8px);
-      display: none;
-      flex-direction: column;
-      z-index: 100;
-      overflow: hidden;
-      animation: drawerSlide 0.2s ease-out;
-    }
-
-    .pothole-audit-drawer.active {
-      display: flex;
-    }
-
-    /* Height Restriction Styles */
-    .height-restriction-drawer {
-      position: absolute;
-      top: 12px;
-      right: 12px;
-      width: 330px;
-      max-height: calc(100% - 24px);
-      background: rgba(13, 17, 23, 0.95);
-      border: 1px solid rgba(245, 158, 11, 0.45);
-      border-top: 3px solid var(--accent-amber);
-      border-radius: 6px;
-      box-shadow: 0 12px 32px rgba(0, 0, 0, 0.7);
-      backdrop-filter: blur(10px);
-      display: none;
-      flex-direction: column;
-      z-index: 95;
-      overflow: hidden;
-      animation: drawerSlide 0.2s ease-out;
-    }
-
-    .height-restriction-drawer.active {
-      display: flex;
-    }
-
-    @keyframes prismSpin {
-      0% { transform: rotate(0deg); }
-      100% { transform: rotate(360deg); }
-    }
-
-    .pothole-count-pill {
-      background: var(--accent-amber);
-      color: #fff;
-      font-size: 0.68rem;
-      font-weight: 700;
-      padding: 1px 7px;
-      border-radius: 10px;
-    }
-
-    .road-class-card {
-      background: #161b22;
-      border-bottom: 1px solid var(--panel-border);
-      padding: 10px 12px;
-      display: flex;
-      flex-direction: column;
-      gap: 6px;
-    }
-
-    .road-badge-row {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-    }
-
-    .road-type-pill {
-      font-size: 0.72rem;
-      font-weight: 700;
-      padding: 3px 8px;
-      border-radius: 4px;
-      letter-spacing: 0.5px;
-      background: rgba(88, 166, 255, 0.15);
-      color: var(--accent-blue);
-      border: 1px solid rgba(88, 166, 255, 0.3);
-    }
-
-    .road-type-pill.muddy {
-      background: rgba(217, 119, 6, 0.15);
-      color: #f59e0b;
-      border-color: rgba(217, 119, 6, 0.3);
-    }
-
-    .pqi-score-badge {
-      font-size: 0.7rem;
-      font-weight: 600;
-      color: var(--text-muted);
-      background: #0d1117;
-      padding: 2px 6px;
-      border-radius: 3px;
-      border: 1px solid var(--panel-border);
-    }
-
-    .road-condition-desc {
-      font-size: 0.68rem;
-      color: var(--text-muted);
-      line-height: 1.3;
-    }
-
-    .pothole-card {
-      background: #0d1117;
-      border: 1px solid var(--panel-border);
-      border-radius: 4px;
-      padding: 9px 10px;
-      cursor: pointer;
-      display: flex;
-      flex-direction: column;
-      gap: 5px;
-      transition: all 0.15s ease;
-    }
-
-    .pothole-card:hover {
-      border-color: var(--accent-blue);
-      background: #161b22;
-    }
-
-    .pothole-card.selected {
-      border-color: var(--accent-blue);
-      background: rgba(88, 166, 255, 0.12);
-    }
-
-    .pothole-card-top {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-    }
-
-    .pothole-id {
-      font-weight: 700;
-      font-size: 0.8rem;
-      color: var(--text-main);
-      display: flex;
-      align-items: center;
-      gap: 6px;
-    }
-
-    .pothole-severity-badge {
-      font-size: 0.65rem;
-      font-weight: 700;
-      padding: 1px 6px;
-      border-radius: 3px;
-      text-transform: uppercase;
-    }
-
-    .severity-CRITICAL {
-      background: rgba(239, 68, 68, 0.18);
-      color: #ef4444;
-      border: 1px solid rgba(239, 68, 68, 0.4);
-    }
-
-    .severity-MODERATE {
-      background: rgba(245, 158, 11, 0.18);
-      color: #f59e0b;
-      border: 1px solid rgba(245, 158, 11, 0.4);
-    }
-
-    .severity-MINOR {
-      background: rgba(59, 130, 246, 0.18);
-      color: #60a5fa;
-      border: 1px solid rgba(59, 130, 246, 0.4);
-    }
-
-    .pothole-depth-hero {
-      font-size: 0.95rem;
-      font-weight: 800;
-      letter-spacing: -0.5px;
-    }
-
-    .pothole-depth-hero.crit {
-      color: #ef4444;
-    }
-    .pothole-depth-hero.mod {
-      color: #f59e0b;
-    }
-    .pothole-depth-hero.min {
-      color: #60a5fa;
-    }
-
-    .pothole-convoy-tip {
-      font-size: 0.66rem;
-      color: #94a3b8;
-      line-height: 1.3;
-      background: #0b0f17;
-      padding: 4px 6px;
-      border-radius: 3px;
-      border-left: 2px solid var(--accent-blue);
-    }
-
-    .pothole-convoy-tip.crit {
-      border-left-color: #ef4444;
-      color: #fca5a5;
-    }
-
-    /* Video overlay canvas */
-    .video-wrapper {
-      position: relative;
-    }
-
-    .video-overlay-canvas {
-      position: absolute;
-      top: 0;
-      left: 0;
-      width: 100%;
-      height: 100%;
-      pointer-events: none;
-      z-index: 5;
-    }
-
-    .video-road-badge {
-      position: absolute;
-      top: 10px;
-      right: 10px;
-      background: rgba(13, 17, 23, 0.85);
-      border: 1px solid var(--panel-border);
-      border-radius: 4px;
-      padding: 4px 8px;
-      font-size: 0.68rem;
-      font-weight: 700;
-      color: var(--text-main);
-      display: flex;
-      align-items: center;
-      gap: 6px;
-      z-index: 6;
-      backdrop-filter: blur(4px);
-    }
-
-    .road-dot {
-      width: 7px;
-      height: 7px;
-      border-radius: 50%;
-      background: #3b82f6;
-    }
-
-    .road-dot.muddy {
-      background: #f59e0b;
-    }
-
-    .btn-clean-mini {
-      background: transparent;
-      border: 1px solid var(--panel-border);
-      border-radius: 4px;
-      color: var(--text-muted);
-      font-size: 0.68rem;
-      font-weight: 600;
-      padding: 2px 7px;
-      cursor: pointer;
-      transition: all 0.15s ease;
-    }
-
-    .btn-clean-mini:hover {
-      color: var(--text-main);
-      border-color: #8b949e;
-      background: #161b22;
-    }
-
-    .btn-clean-mini.active {
-      color: var(--accent-blue);
-      border-color: var(--accent-blue);
-      background: rgba(88, 166, 255, 0.12);
-    }
-
-    /* =================================================================
-       CLEAN & SIMPLE MESHIFY PROGRESS BAR
-       ================================================================= */
-    .meshify-simple-card {
-      width: 380px;
-      max-width: 90vw;
-      background: #111827;
-      border: 1px solid var(--panel-border);
-      border-radius: 8px;
-      padding: 18px 22px;
-      box-shadow: 0 16px 40px rgba(0, 0, 0, 0.8);
-      display: flex;
-      flex-direction: column;
-      gap: 12px;
-      animation: modal-fade-in 0.15s ease-out;
-    }
-
-    .meshify-simple-header {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-    }
-
-    .meshify-simple-title {
-      font-size: 0.90rem;
-      font-weight: 600;
-      color: #f1f5f9;
-      letter-spacing: 0.3px;
-    }
-
-    .meshify-simple-pct {
-      font-size: 1.15rem;
-      font-weight: 700;
-      font-family: var(--font-mono);
-      color: var(--accent-cyan);
-      transition: color 0.2s ease;
-    }
-
-    .meshify-simple-pct.complete {
-      color: #10b981;
-    }
-
-    .meshify-simple-track {
-      width: 100%;
-      height: 7px;
-      background: #1f2937;
-      border-radius: 4px;
-      overflow: hidden;
-      border: 1px solid rgba(255, 255, 255, 0.05);
-    }
-
-    .meshify-simple-fill {
-      height: 100%;
-      width: 0%;
-      background: var(--accent-cyan);
-      border-radius: 4px;
-      transition: width 0.25s ease, background 0.3s ease;
-    }
-
-    .meshify-simple-fill.complete {
-      background: #10b981;
-    }
-
-    .meshify-simple-footer {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      font-size: 0.72rem;
-      color: var(--text-muted);
-    }
-
-    .meshify-simple-status {
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      flex: 1;
-    }
-
-    .meshify-simple-timer {
-      font-family: var(--font-mono);
-      color: var(--text-muted);
-      margin-left: 10px;
-      flex-shrink: 0;
-    }
-  </style>
 </head>
-
 <body>
-  <!-- Top Bar Header (Desktop / IDE Menu Bar Style) -->
-  <header class="top-bar">
-    <div class="top-left">
-      <div class="brand-group">
-        <span class="brand-title">PRISM <span>DEFENSE 3D</span></span>
-        <span class="sub-badge">SIH26158 NTRO</span>
+  <header class="topbar">
+    <div class="brand"><span class="brand-mark">PRISM</span><span class="brand-sub">Survey intelligence</span></div>
+    <nav class="menus" id="menus">
+      <div class="menu">
+        <button type="button">Mission</button>
+        <div class="menu-list">
+          <button class="menu-item" data-action="new-mission" type="button">New mission…<span class="kbd">Ctrl+N</span></button>
+          <button class="menu-item" data-action="open-survey" type="button">Open saved survey…<span class="kbd">Ctrl+O</span></button>
+          <button class="menu-item hidden" data-action="back-to-active" type="button">Back to current mission</button>
+          <div class="menu-sep"></div>
+          <button class="menu-item" data-action="save-survey" type="button">Save as baseline…<span class="kbd">Ctrl+S</span></button>
+          <button class="menu-item" data-tool="compare" type="button">Compare with a baseline…</button>
+          <div class="menu-sep"></div>
+          <button class="menu-item" data-action="recalibrate" type="button">Recalibrate with flight log</button>
+          <button class="menu-item" data-action="build-mesh" type="button">Build surface mesh</button>
+          <div class="menu-sep"></div>
+          <button class="menu-item" data-action="export-centre" type="button">Export centre…<span class="kbd">Ctrl+E</span></button>
+          <button class="menu-item" data-tool="quality" type="button">Quality &amp; accuracy report</button>
+        </div>
       </div>
-
-      <!-- Desktop Dropdown Menus (Antigravity IDE Style) -->
-      <nav class="menu-bar">
-        <!-- File Menu -->
-        <div class="menu-item-wrapper">
-          <button class="menu-btn" id="menu-btn-file" type="button">File ▾</button>
-          <div class="dropdown-menu" id="dropdown-file">
-            <button class="dropdown-item" id="menu-file-ingest" type="button">
-              <span>Ingest Mission / Run Pipeline...</span>
-              <span class="shortcut">Ctrl+O</span>
-            </button>
-            <button class="dropdown-item" id="menu-file-save-baseline" type="button">
-              <span>Save Baseline Model...</span>
-              <span class="shortcut">Ctrl+S</span>
-            </button>
-            <button class="dropdown-item" id="menu-file-load-baseline" type="button">
-              <span>Open Saved Model / Baseline...</span>
-              <span class="shortcut">Ctrl+L</span>
-            </button>
-            <button class="dropdown-item" id="menu-file-restore-active" type="button" style="display: none; color: var(--accent-cyan);">
-              <span>Restore Active Recon Model</span>
-            </button>
-            <button class="dropdown-item" id="menu-file-compare" type="button">
-              <span>Compare with Baseline (Change Detection)...</span>
-              <span class="shortcut">Ctrl+D</span>
-            </button>
-            <div class="dropdown-divider"></div>
-            <button class="dropdown-item" id="menu-file-export-obj" type="button">
-              <span>Export Model (.OBJ)...</span>
-            </button>
-            <button class="dropdown-item" id="menu-file-meshify" type="button">
-              <span>Meshify Surface (Poisson)...</span>
-            </button>
-          </div>
+      <div class="menu">
+        <button type="button">View</button>
+        <div class="menu-list">
+          <div class="menu-label">Model</div>
+          <button class="menu-item" data-render="points" type="button"><span class="check"></span>Points</button>
+          <button class="menu-item" data-render="surface" type="button"><span class="check"></span>Surface</button>
+          <button class="menu-item" data-render="clay" type="button"><span class="check"></span>Clay (shape only)</button>
+          <button class="menu-item" data-render="wire" type="button"><span class="check"></span>Wireframe</button>
+          <div class="menu-label">Colour</div>
+          <button class="menu-item" data-color="photo" type="button"><span class="check"></span>Photo colours</button>
+          <button class="menu-item" data-color="height" type="button"><span class="check"></span>Height above ground</button>
+          <button class="menu-item" data-color="cover" type="button"><span class="check"></span>Land cover</button>
+          <div class="menu-label">Overlays</div>
+          <button class="menu-item" data-overlay="exposure" type="button"><span class="check"></span>Visibility from buildings</button>
+          <button class="menu-item" data-overlay="flightpath" type="button"><span class="check"></span>Flight path</button>
+          <button class="menu-item" data-action="clear-overlays" type="button">Clear all overlays<span class="kbd">C</span></button>
+          <div class="menu-sep"></div>
+          <button class="menu-item" data-action="reset-view" type="button">Reset camera<span class="kbd">R</span></button>
+          <button class="menu-item" data-action="top-view" type="button">Top view (north up)<span class="kbd">T</span></button>
         </div>
-
-        <!-- Format Menu -->
-        <div class="menu-item-wrapper">
-          <button class="menu-btn" id="menu-btn-format" type="button">Format ▾</button>
-          <div class="dropdown-menu" id="dropdown-format">
-            <button class="dropdown-item" id="menu-format-points" type="button">
-              <span class="menu-check" id="check-format-points"></span>
-              <span>Points (Point Cloud)</span>
-            </button>
-            <button class="dropdown-item active" id="menu-format-mesh" type="button">
-              <span class="menu-check" id="check-format-mesh">✓</span>
-              <span>Solid 3D Mesh</span>
-            </button>
-            <button class="dropdown-item" id="menu-format-wireframe" type="button">
-              <span class="menu-check" id="check-format-wireframe"></span>
-              <span>Wireframe Topology</span>
-            </button>
-            <button class="dropdown-item" id="menu-format-clay" type="button">
-              <span class="menu-check" id="check-format-clay"></span>
-              <span>Clay Surface</span>
-            </button>
-            <div class="dropdown-divider"></div>
-            <button class="dropdown-item" id="menu-format-recon" type="button">
-              <span class="menu-check" id="check-format-recon">✓</span>
-              <span>Recon View</span>
-            </button>
-            <button class="dropdown-item" id="menu-format-diff" type="button">
-              <span class="menu-check" id="check-format-diff"></span>
-              <span>Alert Diff Map</span>
-            </button>
-            <div class="dropdown-divider"></div>
-            <button class="dropdown-item" id="menu-format-potholes" type="button">
-              <span class="menu-check" id="check-format-potholes"></span>
-              <span>Road & Potholes (BRO Audit)</span>
-            </button>
-          </div>
-        </div>
-
-        <!-- Tools Menu -->
-        <div class="menu-item-wrapper">
-          <button class="menu-btn" id="menu-btn-tools" type="button">Tools ▾</button>
-          <div class="dropdown-menu" id="dropdown-tools">
-            <button class="dropdown-item" id="menu-tool-caliper" type="button">
-              <span>Caliper Measurement Tool</span>
-              <span class="shortcut">M</span>
-            </button>
-            <button class="dropdown-item" id="menu-tool-clear-caliper" type="button">
-              <span>Clear Measurement Markers</span>
-            </button>
-            <div class="dropdown-divider"></div>
-            <button class="dropdown-item" id="menu-tool-height-restriction" type="button">
-              <span>Height Restriction Audit...</span>
-              <span class="shortcut">H</span>
-            </button>
-            <button class="dropdown-item" id="menu-tool-clear-height" type="button" style="display: none; color: var(--accent-red);">
-              <span>Clear Height Restriction</span>
-            </button>
-            <div class="dropdown-divider"></div>
-            <button class="dropdown-item" id="menu-tool-potholes" type="button">
-              <span>Road & Potholes (BRO Audit)...</span>
-            </button>
-            <button class="dropdown-item" id="menu-tool-meshify" type="button">
-              <span>Meshify Surface (Poisson)...</span>
-            </button>
-            <div class="dropdown-divider"></div>
-            <button class="dropdown-item" id="menu-tool-save-baseline" type="button">
-              <span>Save Baseline Model...</span>
-              <span class="shortcut">Ctrl+S</span>
-            </button>
-            <button class="dropdown-item" id="menu-tool-compare" type="button">
-              <span>Compare with Baseline...</span>
-              <span class="shortcut">Ctrl+D</span>
-            </button>
-            <div class="dropdown-divider"></div>
-            <button class="dropdown-item" id="menu-tool-recenter" type="button">
-              <span>Recenter / Reset Camera</span>
-              <span class="shortcut">R</span>
-            </button>
-          </div>
-        </div>
-      </nav>
-    </div>
-
-    <div class="top-actions">
-      <div id="pipeline-status-badge" class="status-badge">
-        <span id="pipeline-dot" class="dot"></span>
-        <span id="pipeline-status-text">PIPELINE: READY</span>
       </div>
-
-      <button id="open-ingest-btn" class="btn-clean" type="button">
-        Ingest Mission
-      </button>
+      <div class="menu">
+        <button type="button">Analyze</button>
+        <div class="menu-list">
+          <button class="menu-item" data-tool="overview" type="button">Survey overview</button>
+          <div class="menu-sep"></div>
+          <button class="menu-item" data-tool="measure" type="button">Measure distance<span class="kbd">M</span></button>
+          <button class="menu-item" data-tool="height" type="button">Measure height<span class="kbd">H</span></button>
+          <button class="menu-item" data-tool="inventory" type="button">Structures (roofs, facades)</button>
+          <button class="menu-item" data-tool="ceiling" type="button">Height ceiling check</button>
+          <div class="menu-sep"></div>
+          <button class="menu-item" data-tool="roads" type="button">Roads &amp; potholes</button>
+          <button class="menu-item" data-tool="sites" type="button">Base site finder</button>
+          <button class="menu-item" data-tool="route" type="button">Covert route</button>
+          <div class="menu-sep"></div>
+          <button class="menu-item" data-tool="compare" type="button">Change detection</button>
+          <div class="menu-sep"></div>
+          <button class="menu-item" data-tool="quality" type="button">Quality &amp; accuracy<span class="kbd">Q</span></button>
+        </div>
+      </div>
+    </nav>
+    <div class="mission-chip" id="mission-chip">
+      <span class="status-dot" id="cal-dot"></span>
+      <span class="name" id="mission-name">No survey loaded</span>
+      <span id="cal-text"></span>
     </div>
+    <button class="btn primary small" data-action="new-mission" type="button">New mission</button>
   </header>
 
-  <!-- Main Dashboard Viewport -->
-  <main class="dashboard-grid">
-    <!-- Left Side: UAV Stream + Telemetry Box -->
-    <div class="video-column">
-      <section class="panel video-panel">
-        <div class="panel-header">
-          <h2>LIVE UAV STREAM [CAM-01]</h2>
-          <div style="display: flex; align-items: center; gap: 8px;">
-            <button id="toggle-video-overlay-btn" class="btn-clean-mini active" type="button" title="Toggle AI Vision Detection Overlay on Video">Vision: ON</button>
-            <span class="panel-tag" id="video-info-tag">1080p // 30 FPS</span>
-          </div>
+  <main class="workspace" id="workspace">
+    <aside class="col" id="left-col">
+      <section class="section">
+        <div class="section-head">
+          <span class="section-title">Drone video</span>
+          <span class="spacer"></span>
+          <label class="check" title="Draw analysis results on the video (uses the reconstructed camera poses)">
+            <input type="checkbox" id="ar-toggle" checked> Overlay
+          </label>
         </div>
-        <div class="video-wrapper">
-          <div class="cam-watermark" id="cam-watermark">REC ● ACTIVE SENSOR</div>
-          <div id="video-road-badge" class="video-road-badge" style="display: none;">
-            <span class="road-dot" id="video-road-dot"></span>
-            <span id="video-road-badge-text">BRO TAR ROAD</span>
-          </div>
-          <!-- Video Standby Overlay for Baselines without recorded video -->
-          <div id="video-standby-overlay" style="display: none; position: absolute; inset: 0; background: rgba(13, 17, 23, 0.94); z-index: 5; flex-direction: column; align-items: center; justify-content: center; gap: 10px; padding: 20px; text-align: center;">
-            <div style="width: 44px; height: 44px; border-radius: 50%; border: 2px dashed var(--accent-amber); display: flex; align-items: center; justify-content: center; color: var(--accent-amber); font-size: 1.2rem;">
-              ✈
-            </div>
-            <strong style="color: var(--text-main); font-size: 0.85rem; letter-spacing: 0.05em;">NO VIDEO ARCHIVE FOR THIS BASELINE</strong>
-            <p style="color: var(--text-muted); font-size: 0.72rem; max-width: 320px; line-height: 1.5; margin: 0;">
-              Sortie archived as a 3D tactical point cloud with synchronized GPS flight telemetry, SRT waypoints, and surface mesh.
-            </p>
-            <div style="display: flex; gap: 8px; margin-top: 4px;">
-              <span class="panel-tag" style="border-color: var(--accent-cyan); color: var(--accent-cyan);">3D MODEL ACTIVE</span>
-              <span class="panel-tag" style="border-color: var(--accent-green); color: var(--accent-green);">TELEMETRY SYNCED</span>
-            </div>
-          </div>
-          <video id="uav-video" controls autoplay muted loop>
-            <source src="http://127.0.0.1:8000/data/raw_videos/drone_flight.mp4" type="video/mp4">
-            Your browser does not support HTML5 video.
-          </video>
-          <canvas id="video-overlay-canvas" class="video-overlay-canvas"></canvas>
+        <div class="video-box">
+          <video id="video" controls muted playsinline preload="metadata"></video>
+          <canvas id="video-ar"></canvas>
+          <div class="video-empty hidden" id="video-empty">No video stored with this survey</div>
         </div>
       </section>
-
-      <section class="panel telemetry-panel">
-        <div class="panel-header" style="display: flex; justify-content: space-between; align-items: center;">
-          <h2>METRIC TELEMETRY & INTEL</h2>
-          <div style="display: flex; align-items: center; gap: 8px;">
-            <button id="btn-download-srt" class="btn-clean-mini" type="button" title="Download or view SRT telemetry stream" style="color: var(--accent-cyan); border-color: rgba(56, 189, 248, 0.4);">
-              SRT Intel
-            </button>
-            <span class="panel-tag" id="telem-source-tag">GPS SYNC</span>
-          </div>
+      <section class="section">
+        <div class="section-head">
+          <span class="section-title">Flight data</span>
+          <span class="spacer"></span>
+          <span class="faint" id="telem-source"></span>
         </div>
-        <div class="telemetry-grid">
-          <div class="telemetry-item">
-            <span class="label">LATITUDE</span>
-            <span class="val" id="lat-val">--</span>
-          </div>
-          <div class="telemetry-item">
-            <span class="label">LONGITUDE</span>
-            <span class="val" id="lon-val">--</span>
-          </div>
-          <div class="telemetry-item">
-            <span class="label">REL ALTITUDE</span>
-            <span class="val"><span id="alt-val">--</span> m</span>
-          </div>
-          <div class="telemetry-item">
-            <span class="label">TOTAL DISTANCE</span>
-            <span class="val"><span id="dist-val">--</span> m</span>
-          </div>
+        <div class="readouts">
+          <div class="readout"><div class="k">Latitude</div><div class="v" id="r-lat">—</div></div>
+          <div class="readout"><div class="k">Longitude</div><div class="v" id="r-lon">—</div></div>
+          <div class="readout"><div class="k">Altitude (log)</div><div class="v" id="r-alt">—</div></div>
+          <div class="readout"><div class="k">Ground speed</div><div class="v" id="r-spd">—</div></div>
+          <div class="readout"><div class="k">Heading</div><div class="v" id="r-hdg">—</div></div>
+          <div class="readout"><div class="k">Distance flown</div><div class="v" id="r-dist">—</div></div>
         </div>
       </section>
-    </div>
-
-    <!-- Right Side: 3D Scene Viewport -->
-    <section class="panel twin-panel">
-      <div class="panel-header">
-        <div style="display: flex; align-items: center; gap: 10px;">
-          <h2>3D TACTICAL DIGITAL TWIN</h2>
-          <span class="panel-tag" id="model-tag">CUDA MVS POINT CLOUD</span>
-        </div>
-
-        <!-- Viewport Toolbar (Contextual controls for Diff / Baseline navigation only) -->
-        <div class="viewport-toolbar" style="display: flex; align-items: center; gap: 8px;">
-          <div id="diff-view-switcher" style="display: none; gap: 4px;">
-            <button id="view-mode-diff" class="btn-clean" style="color: var(--accent-red); border-color: rgba(239, 68, 68, 0.4);" type="button" title="Alert Map (Structure Changes)">Alert Diff</button>
-            <button id="view-mode-recon" class="btn-clean" type="button" title="Active Recon Scan">Recon</button>
-          </div>
-
-          <button id="return-recon-btn" class="btn-clean" style="display: none; color: var(--accent-cyan); border-color: rgba(56, 189, 248, 0.4); background: rgba(56, 189, 248, 0.1);" type="button" title="Return to active mission reconstruction model">
-            Return to Active Recon
-          </button>
-        </div>
-      </div>
-      <div id="canvas-container">
-        <!-- TACTICAL CHANGE DETECTION ALERT DRAWER -->
-        <div id="diff-alert-drawer" class="diff-alert-drawer">
-          <div class="alert-drawer-header">
-            <div class="alert-drawer-title">
-              <span>TACTICAL CHANGE ALERTS</span>
-              <span id="alert-count-pill" class="alert-count-pill">0</span>
-            </div>
-            <button id="close-alert-drawer-btn" class="modal-close-btn" style="font-size: 1.1rem;" type="button" title="Dismiss Alerts">✕</button>
-          </div>
-          <div class="alert-summary-bar">
-            <span id="alert-overlap-info">Coverage: --%</span>
-            <span id="alert-thresh-info">Threshold: &ge; 1.5m</span>
-          </div>
-          <div id="alert-list-container" class="alert-list">
-            <!-- Alert cards dynamically injected -->
+      <section class="section" style="flex: 1 1 auto;">
+        <div class="section-head">
+          <span class="section-title">Map</span>
+          <span class="spacer"></span>
+          <div class="seg" id="map-seg">
+            <button data-layer="ortho" class="on" type="button">Photo</button>
+            <button data-layer="classes" type="button">Land cover</button>
           </div>
         </div>
+        <div class="minimap-wrap">
+          <canvas id="minimap"></canvas>
+          <div class="minimap-note" id="minimap-note">North up · click to look there</div>
+        </div>
+      </section>
+    </aside>
 
-        <!-- BRO TACTICAL ROAD & POTHOLE AUDIT DRAWER (ON-DEMAND) -->
-        <div id="pothole-audit-drawer" class="pothole-audit-drawer">
-          <div class="alert-drawer-header">
-            <div class="alert-drawer-title">
-              <span>BRO ROAD &amp; POTHOLES</span>
-              <span id="pothole-count-pill" class="pothole-count-pill">0</span>
-            </div>
-            <div style="display: flex; align-items: center; gap: 6px;">
-              <button id="pothole-recompile-btn" class="filter-chip" style="font-size: 0.65rem; padding: 2px 7px; display: none;" type="button" title="Recompute road analysis">↻ Re-run</button>
-              <button id="close-pothole-drawer-btn" class="modal-close-btn" style="font-size: 1.1rem;" type="button" title="Dismiss Road Audit">✕</button>
-            </div>
+    <section class="col">
+      <div class="viewport" id="viewport">
+        <canvas class="gl" id="gl"></canvas>
+        <div class="labels" id="labels"></div>
+        <div class="rail" id="rail"></div>
+        <div class="view-controls">
+          <div class="seg overlay-card" id="render-seg">
+            <button data-render="points" type="button">Points</button>
+            <button data-render="surface" type="button">Surface</button>
+            <button data-render="clay" type="button">Clay</button>
+            <button data-render="wire" type="button">Wire</button>
           </div>
-
-          <!-- 1. ON-DEMAND COMPILE VIEW (shown when road analysis has not yet been executed) -->
-          <div id="pothole-compile-view" style="display: flex; flex-direction: column; gap: 12px; padding: 14px;">
-            <div style="background: rgba(22, 27, 34, 0.9); border: 1px solid rgba(88, 166, 255, 0.25); border-radius: 6px; padding: 12px; font-size: 0.74rem; color: #c9d1d9; line-height: 1.45;">
-              <div style="font-weight: 700; color: var(--accent-amber); margin-bottom: 6px; display: flex; align-items: center; gap: 6px;">
-                <span style="display:inline-block; width:8px; height:8px; border-radius:50%; background:var(--accent-amber);"></span>
-                DECOUPLED ON-DEMAND FEATURE
-              </div>
-              <p style="margin: 0 0 6px 0;">
-                Road surface classification &amp; 3D pothole measurement are decoupled from 3D reconstruction so NTRO core modeling and metric height measurement operate at 100% speed.
-              </p>
-              <p style="margin: 0; color: #8b949e; font-size: 0.70rem;">
-                Click below to compile the road surface assessment and 3D depth profiling now.
-              </p>
-            </div>
-
-            <button id="pothole-run-compile-btn" class="toolbar-btn" style="width: 100%; justify-content: center; height: 38px; font-weight: 700; background: #238636; border: 1px solid #2ea043; color: #fff; cursor: pointer; border-radius: 6px;" type="button">
-              ▶ COMPILE ROAD &amp; POTHOLES
-            </button>
-
-            <div id="pothole-compile-spinner" style="display: none; align-items: center; justify-content: center; gap: 10px; color: var(--accent-blue); font-size: 0.74rem; padding: 10px 0;">
-              <div style="width: 16px; height: 16px; border: 2px solid rgba(56,189,248,0.25); border-top-color: #38bdf8; border-radius: 50%; animation: prismSpin 0.8s linear infinite;"></div>
-              <span>Analyzing BRO road corridor &amp; 3D depths...</span>
-            </div>
-          </div>
-
-          <!-- 2. RESULTS VIEW (shown once compiled) -->
-          <div id="pothole-results-view" style="display: none; flex-direction: column; flex: 1; min-height: 0;">
-            <div class="road-class-card" id="road-class-card">
-              <div class="road-badge-row">
-                <span id="road-type-pill" class="road-type-pill">TAR ROAD (BRO HIGHWAY)</span>
-                <span id="pqi-score-badge" class="pqi-score-badge">PQI: 64/100</span>
-              </div>
-              <div id="road-condition-desc" class="road-condition-desc">Paved Bituminous Surface - Surface Pavement Distress & Freeze-Thaw Spalling</div>
-            </div>
-            <div class="alert-summary-bar">
-              <span id="pothole-max-depth">Max: -- cm</span>
-              <span id="pothole-avg-depth">Avg: -- cm</span>
-              <span id="pothole-damaged-area">Area: -- m²</span>
-            </div>
-            <div id="pothole-list-container" class="alert-list">
-              <!-- Pothole items injected dynamically -->
-            </div>
+          <div class="seg overlay-card" id="color-seg">
+            <button data-color="photo" type="button">Photo</button>
+            <button data-color="height" type="button">Height</button>
+            <button data-color="cover" type="button">Cover</button>
           </div>
         </div>
-
-        <!-- AIRSPACE & TERRAIN HEIGHT RESTRICTION AUDIT DRAWER -->
-        <div id="height-restriction-drawer" class="height-restriction-drawer">
-          <div class="alert-drawer-header" style="border-left: 3px solid var(--accent-amber);">
-            <div class="alert-drawer-title" style="color: var(--accent-amber);">
-              <span>HEIGHT RESTRICTION</span>
-              <span id="height-violation-pill" class="alert-count-pill" style="background: var(--accent-amber); color: #000; font-weight: 700;">0 PTS</span>
-            </div>
-            <div style="display: flex; align-items: center; gap: 6px;">
-              <button id="height-reconfig-btn" class="filter-chip" style="font-size: 0.65rem; padding: 2px 7px;" type="button" title="Change height restriction parameters">⚙ Limit</button>
-              <button id="close-height-drawer-btn" class="modal-close-btn" style="font-size: 1.1rem;" type="button" title="Dismiss Height Audit Drawer">✕</button>
-            </div>
-          </div>
-
-          <div class="alert-summary-bar">
-            <span id="height-ceiling-label">Ceiling: &le; 5.0m</span>
-            <span id="height-peak-label">Peak: -- m</span>
-            <span id="height-breach-label" style="color: var(--accent-red); font-weight: 700;">Breach: -- m</span>
-          </div>
-
-          <!-- Live Dynamic Slider & Controls -->
-          <div style="padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; background: rgba(13, 17, 23, 0.95); border-bottom: 1px solid var(--panel-border);">
-            <span style="color: var(--text-muted); font-weight: 600; font-size: 0.70rem;">ADJUST HEIGHT CEILING:</span>
-            <div style="display: flex; align-items: center; gap: 8px;">
-              <input type="range" id="height-live-slider" min="0.5" max="30.0" step="0.1" value="5.0" style="flex: 1; accent-color: var(--accent-amber); cursor: pointer;">
-              <div style="display: flex; align-items: center; gap: 3px; background: #06090e; border: 1px solid var(--panel-border); border-radius: 4px; padding: 2px 6px;">
-                <input type="number" id="height-live-input" min="0.1" max="100.0" step="0.1" value="5.0"
-                  style="width: 50px; background: transparent; border: none; color: var(--accent-amber); font-weight: 700; font-family: var(--font-mono); font-size: 0.82rem; text-align: right; outline: none;">
-                <span style="color: var(--text-muted); font-size: 0.72rem; font-weight: 600;">m</span>
-              </div>
-            </div>
-            
-            <div style="display: flex; gap: 6px; margin-top: 2px;">
-              <button id="height-focus-peak-btn" class="btn-clean-mini" style="flex: 1; justify-content: center; font-size: 0.68rem; padding: 4px;" type="button" title="Fly camera to focus on highest structure exceeding ceiling">
-                🎯 Focus Peak
-              </button>
-              <button id="height-toggle-plane-btn" class="btn-clean-mini" style="flex: 1; justify-content: center; font-size: 0.68rem; padding: 4px;" type="button" title="Show or hide translucent 3D ceiling grid">
-                Grid: ON
-              </button>
-            </div>
-
-            <div style="display: flex; gap: 6px;">
-              <button id="height-export-report-btn" class="btn-clean-mini" style="flex: 1; justify-content: center; font-size: 0.68rem; padding: 4px; color: var(--accent-cyan); border-color: rgba(56, 189, 248, 0.4);" type="button" title="Download height violation audit report">
-                Export Intel Report
-              </button>
-              <button id="height-clear-btn" class="btn-clean-mini" style="flex: 1; justify-content: center; font-size: 0.68rem; padding: 4px; color: var(--accent-red); border-color: rgba(239, 68, 68, 0.4);" type="button" title="Clear height restriction and restore original 3D colors">
-                Reset / Clear
-              </button>
-            </div>
-          </div>
-
-          <!-- Violations Breakdown Card -->
-          <div id="height-violation-details" style="padding: 10px 12px; font-size: 0.72rem; display: flex; flex-direction: column; gap: 6px;">
-            <div id="height-status-card" style="padding: 8px 10px; border-radius: 4px; background: rgba(239, 68, 68, 0.12); border: 1px solid rgba(239, 68, 68, 0.3); color: #f85149;">
-              <strong id="height-status-title">RESTRICTION BREACH DETECTED</strong>
-              <div id="height-status-sub" style="font-size: 0.68rem; color: #c9d1d9; margin-top: 2px;">Points exceeding ceiling marked in Crimson Red.</div>
-            </div>
-            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 6px; font-size: 0.68rem; color: var(--text-muted); background: #0d1117; padding: 8px; border-radius: 4px; border: 1px solid var(--panel-border);">
-              <div>Model Points: <strong id="height-stat-total" style="color: #fff;">--</strong></div>
-              <div>Violating Pts: <strong id="height-stat-violating" style="color: var(--accent-red);">--</strong></div>
-              <div>Breach Ratio: <strong id="height-stat-ratio" style="color: var(--accent-amber);">--%</strong></div>
-              <div>Ground Datum: <strong id="height-stat-ground" style="color: var(--accent-cyan);">--m</strong></div>
-            </div>
-          </div>
+        <div class="pick-banner overlay-card hidden" id="pick-banner"></div>
+        <svg class="compass" id="compass" viewBox="-23 -23 46 46" aria-label="Compass">
+          <circle r="21" fill="rgba(27,30,33,0.9)" stroke="#3b4147"></circle>
+          <g id="compass-needle">
+            <path d="M0,-16 L5,0 L0,-3 L-5,0 Z" fill="#c9a45c"></path>
+            <path d="M0,16 L5,0 L0,3 L-5,0 Z" fill="#75726b"></path>
+            <text y="-18.5" text-anchor="middle" font-size="7" fill="#e7e4dd" font-family="IBM Plex Sans, sans-serif">N</text>
+          </g>
+        </svg>
+        <div class="scalebar" id="scalebar"><span id="scale-label">—</span><div class="bar" id="scale-bar"></div></div>
+        <div class="coords">
+          <span id="c-xyz">x —  y —  z —</span>
+          <span id="c-ll"></span>
+          <span id="c-hag"></span>
+          <span class="hint">Left drag: orbit · Right drag: pan · Scroll: zoom · Double-click: focus</span>
         </div>
-
-        <!-- TACTICAL MEASUREMENT HUD OVERLAY -->
-        <div class="tactical-readout-box">
-          <span class="readout-label">MEASUREMENT (M to arm)</span>
-          <div id="measure-readout">STANDBY</div>
+        <div class="loading-veil" id="veil">
+          <span id="veil-text">Loading survey…</span>
+          <div class="bar-track"><div class="bar-fill" id="veil-bar"></div></div>
         </div>
       </div>
     </section>
+
+    <aside class="col inspector" id="inspector">
+      <div class="inspector-head">
+        <h2 id="insp-title">Overview</h2>
+        <span class="spacer"></span>
+        <button class="btn ghost small" id="insp-close" type="button" title="Hide panel">Hide</button>
+      </div>
+      <div class="inspector-body" id="insp-body"></div>
+    </aside>
   </main>
 
-  <!-- Desktop Bottom Status Bar (VS Code / Antigravity IDE style) -->
-  <footer class="app-status-bar">
-    <div class="status-left">
-      <span class="status-pill"><span class="status-dot"></span> PRISM ENGINE READY</span>
-      <span class="status-sep">|</span>
-      <span><kbd>Left-Click</kbd> Orbit</span>
-      <span><kbd>Right-Click</kbd> Pan</span>
-      <span><kbd>Scroll</kbd> Zoom</span>
-      <span><kbd>M</kbd> Measure</span>
-      <span><kbd>H</kbd> Height Limit</span>
-      <span><kbd>R</kbd> Recenter</span>
-    </div>
-    <div class="status-right">
-      <span id="status-shading-mode">FORMAT: SOLID MESH</span>
-      <span class="status-sep">|</span>
-      <span>RTX 3050 CUDA</span>
+  <footer class="statusbar">
+    <span class="status-dot" id="sb-dot"></span>
+    <span id="sb-text">Ready</span>
+    <span class="sep"></span>
+    <span id="sb-model"></span>
+    <span class="sep"></span>
+    <span id="sb-cal"></span>
+    <div class="right">
+      <span id="sb-job"></span>
+      <div class="progress hidden" id="sb-progress"><span></span></div>
+      <button class="btn ghost small hidden" id="sb-show-inspector" type="button">Show panel</button>
     </div>
   </footer>
 
-  <!-- =================================================================
-       TACTICAL INGESTION & 3D PIPELINE MODAL
-       ================================================================= -->
-  <div id="ingest-modal" class="modal-backdrop">
-    <div class="tactical-modal">
-      <div class="modal-header">
-        <div class="modal-title-group">
-          <h3>// MISSION DATA INGESTION & PIPELINE CONTROL</h3>
-          <p>Autonomous Single-Pass UAV to 3D Digital Twin Engine (RTX 3050 Optimized)</p>
-        </div>
-        <button id="close-modal-btn" class="modal-close-btn" type="button">✕</button>
+  <!-- New mission -->
+  <div class="modal-back" id="m-mission">
+    <div class="modal">
+      <div class="modal-head">
+        <div><h3>New mission</h3><p>Reconstruct a 3-D model from drone footage, or load a package produced in Google Colab.</p></div>
+        <button class="btn ghost small x" data-close type="button">Close</button>
       </div>
-
       <div class="modal-body">
-        <!-- Input Modality Selector -->
-        <div class="option-group">
-          <div class="option-label">
-            <span>1. Media Input Source</span>
-            <span id="input-mode-hint" style="color: var(--accent-blue);">Video Ingestion</span>
-          </div>
-          <div class="option-pills" style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px;">
-            <button id="mode-video-btn" class="pill-btn active" type="button">
-              <strong>Drone Video</strong>
-              <span class="sub">MP4 / MOV flight pass (auto-decimated)</span>
-            </button>
-            <button id="mode-frames-btn" class="pill-btn" type="button">
-              <strong>Extracted Frames</strong>
-              <span class="sub">ZIP archive (raw frame dataset)</span>
-            </button>
-            <button id="mode-colab-btn" class="pill-btn" type="button">
-              <strong>Google Colab Package</strong>
-              <span class="sub">Pre-computed ZIP (Zero Local GPU Stress)</span>
-            </button>
+        <div class="field">
+          <label>Source</label>
+          <div class="choice-grid" id="mm-source">
+            <button class="choice on" data-source="video" type="button"><b>Drone video</b><span>MP4 / MOV, frames picked automatically</span></button>
+            <button class="choice" data-source="frames" type="button"><b>Photo set</b><span>ZIP of still images</span></button>
+            <button class="choice" data-source="colab" type="button"><b>Colab package</b><span>prism_colab_bundle.zip (GPU processed)</span></button>
           </div>
         </div>
-
-        <!-- Telemetry / Coordinates Selector -->
-        <div class="option-group">
-          <div class="option-label">
-            <span>2. Coordinate Telemetry</span>
-            <span id="coords-mode-hint" style="color: var(--accent-blue);">Attached Telemetry</span>
+        <div class="drop" id="mm-drop-media">
+          <div id="mm-media-title">Drop the drone video here, or click to choose</div>
+          <div class="file" id="mm-media-file"></div>
+          <input type="file" id="mm-media" accept=".mp4,.mov,.avi,.mkv,.m4v,.zip" hidden>
+        </div>
+        <div class="drop" id="mm-drop-log">
+          <div>Flight log (recommended): DJI .SRT, CSV or JSON</div>
+          <div class="faint" style="font-size: 11px; margin-top: 3px;">GPS gives true metric scale and north. Altitude is read from the log automatically.</div>
+          <div class="file" id="mm-log-file"></div>
+          <input type="file" id="mm-log" accept=".srt,.SRT,.csv,.json,.txt" hidden>
+        </div>
+        <details class="optional" id="mm-optional">
+          <summary>Optional sensor inputs <span class="faint">RTK / PPK, camera calibration, IMU flight log</span></summary>
+          <div class="grid2">
+            <div class="drop small" id="mm-drop-rtk"><div>RTK / PPK positions</div><div class="faint">RTKLIB .pos or CSV · cm-level georeference</div>
+              <div class="file" id="mm-rtk-file"></div><input type="file" id="mm-rtk" accept=".pos,.csv,.txt" hidden></div>
+            <div class="drop small" id="mm-drop-cal"><div>Camera calibration</div><div class="faint">OpenCV YAML / JSON or COLMAP cameras.txt</div>
+              <div class="file" id="mm-cal-file"></div><input type="file" id="mm-cal" accept=".yaml,.yml,.json,.txt,.xml" hidden></div>
           </div>
-          <div class="option-pills">
-            <button id="coords-yes-btn" class="pill-btn active" type="button">
-              <strong>With Coordinates / Log</strong>
-              <span class="sub">DJI .SRT or Mid-Air sensor_records.csv</span>
-            </button>
-            <button id="coords-no-btn" class="pill-btn" type="button">
-              <strong>Without Coordinates</strong>
-              <span class="sub">Pure visual SfM + PCA auto-leveling</span>
-            </button>
+          <div class="drop small" id="mm-drop-imu"><div>IMU / flight record CSV (AirData, DJI, Litchi)</div><div class="faint">Attitude and gimbal angles; also a GPS log when there is no .SRT</div>
+            <div class="file" id="mm-imu-file"></div><input type="file" id="mm-imu" accept=".csv" hidden></div>
+          <label class="check"><input type="checkbox" id="mm-dynamic" checked> Remove moving vehicles, people and animals (sky is always masked)</label>
+        </details>
+        <div class="field" id="mm-quality-field">
+          <label>Processing on this computer</label>
+          <div class="choice-grid four" id="mm-quality">
+            <button class="choice" data-quality="fast" type="button"><b>Quick look</b><span>Sparse model, ~5 min</span></button>
+            <button class="choice on" data-quality="medium" type="button"><b>Standard</b><span>Dense cloud, ~15 min</span></button>
+            <button class="choice" data-quality="high" type="button"><b>Detailed</b><span>More frames, ~25 min</span></button>
+            <button class="choice" data-quality="ultra" type="button"><b>Detailed + mesh</b><span>Adds gap-free surface</span></button>
           </div>
         </div>
-
-        <!-- Quality Preset -->
-        <div class="option-group">
-          <div class="option-label">
-            <span>3. Processing Speed Profile (NTRO Benchmark)</span>
-            <span id="quality-mode-hint" style="color: var(--accent-amber);">~12-15 min (NTRO Spec)</span>
-          </div>
-          <div class="option-pills quad">
-            <button id="quality-fast-btn" class="pill-btn" type="button" data-quality="fast">
-              <strong>Fast Tactical</strong>
-              <span class="sub">~3-5m / 45 frames (Point Cloud)</span>
-            </button>
-            <button id="quality-med-btn" class="pill-btn active" type="button" data-quality="medium">
-              <strong>Standard Recon</strong>
-              <span class="sub">~12-15m / 75 frames (NTRO Cloud)</span>
-            </button>
-            <button id="quality-high-btn" class="pill-btn" type="button" data-quality="high">
-              <strong>High Fidelity</strong>
-              <span class="sub">~20-25m / 110 frames (Dense Cloud)</span>
-            </button>
-            <button id="quality-ultra-btn" class="pill-btn" type="button" data-quality="ultra">
-              <strong>Ultra 3D Mesh</strong>
-              <span class="sub">~25-30m / Blender .OBJ (Poisson)</span>
-            </button>
-          </div>
+        <div class="callout info hidden" id="mm-colab-note">
+          The package already contains the model, camera poses and flight log. Scale and north are verified against the GPS on import.
         </div>
-
-        <!-- Dropzones -->
-        <div class="dropzone-container">
-          <!-- Media Dropzone -->
-          <div id="media-dropzone" class="dropzone">
-            <svg class="dropzone-icon-svg" width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-              <polygon points="23 7 16 12 23 17 23 7"></polygon>
-              <rect x="1" y="5" width="15" height="14" rx="2" ry="2"></rect>
-            </svg>
-            <div class="dropzone-title" id="media-dropzone-title">DRAG & DROP DRONE VIDEO (.MP4)</div>
-            <div class="dropzone-sub" id="media-dropzone-sub">or click to browse local filesystem</div>
-            <input type="file" id="media-file-input" accept=".mp4,.mov,.avi,.mkv,.zip" style="display: none;">
-            <div id="media-file-badge" class="file-badge">
-              <span id="media-filename">No file chosen</span>
-              <span id="media-filesize">-- MB</span>
-            </div>
-          </div>
-
-          <!-- Telemetry Dropzone -->
-          <div id="telemetry-dropzone" class="dropzone">
-            <svg class="dropzone-icon-svg" width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
-              <polyline points="14 2 14 8 20 8"></polyline>
-              <line x1="16" y1="13" x2="8" y2="13"></line>
-              <line x1="16" y1="17" x2="8" y2="17"></line>
-              <polyline points="10 9 9 9 8 9"></polyline>
-            </svg>
-            <div class="dropzone-title">DRAG & DROP TELEMETRY FILE (.SRT / .CSV / .JSON)</div>
-            <div class="dropzone-sub">Accepts DJI subtitle tracks or Mid-Air sensor_records.csv</div>
-            <input type="file" id="telemetry-file-input" accept=".srt,.csv,.json" style="display: none;">
-            <div id="telemetry-file-badge" class="file-badge">
-              <span id="telemetry-filename">No telemetry file chosen</span>
-              <span id="telemetry-filesize">-- KB</span>
-            </div>
-          </div>
-        </div>
-
-        <!-- Live Pipeline Monitor HUD -->
-        <div id="pipeline-monitor" class="pipeline-monitor">
-          <div class="monitor-header">
-            <div class="monitor-stage-title">
-              <span class="dot running"></span>
-              <span id="monitor-stage-text">CUDA RECONSTRUCTION IN PROGRESS</span>
-            </div>
-            <span class="monitor-timer" id="monitor-timer">T+ 00:00</span>
-          </div>
-
-          <div class="progress-bar-track">
-            <div id="progress-bar-fill" class="progress-bar-fill"></div>
-          </div>
-
-          <div id="pipeline-terminal" class="terminal-console">Initializing PRISM Mission Pipeline...</div>
+        <div class="hidden" id="mm-progress">
+          <div class="row" style="margin-bottom: 6px;"><b id="mm-stage">Starting</b><span class="spacer grow"></span><span class="mono faint" id="mm-timer">0:00</span></div>
+          <div class="bar-track" style="width: 100%; margin-bottom: 8px;"><div class="bar-fill" id="mm-bar"></div></div>
+          <div class="console" id="mm-console"></div>
         </div>
       </div>
-
-      <div class="modal-footer">
-        <div class="footer-left">
-          <span>Target Hardware: <strong>NVIDIA GeForce RTX 3050 (4GB CUDA)</strong></span>
-        </div>
-        <div style="display: flex; gap: 10px;">
-          <button id="cancel-pipeline-btn" class="btn-tactical btn-danger" type="button" style="display: none;">
-            ABORT PIPELINE
-          </button>
-          <button id="start-pipeline-btn" class="btn-tactical" type="button">
-            INITIATE 3D RECONSTRUCTION
-          </button>
-        </div>
+      <div class="modal-foot">
+        <span class="faint" id="mm-hint">Large 4K videos: use the Colab notebook, then import its package here.</span>
+        <span class="spacer"></span>
+        <button class="btn danger hidden" id="mm-cancel" type="button">Stop</button>
+        <button class="btn primary" id="mm-start" type="button">Start reconstruction</button>
       </div>
     </div>
   </div>
 
-  <!-- =================================================================
-       SAVE BASELINE MODAL
-       ================================================================= -->
-  <div id="save-baseline-modal" class="modal-backdrop">
-    <div class="tactical-modal" style="width: 520px;">
-      <div class="modal-header">
-        <div class="modal-title-group">
-          <h3>// ARCHIVE RECONSTRUCTION AS BASELINE</h3>
-          <p>Selective 3D Archival & Storage Optimization (NTRO Recon Standard)</p>
-        </div>
-        <button id="close-save-baseline-btn" class="modal-close-btn" type="button">✕</button>
+  <!-- Open saved survey -->
+  <div class="modal-back" id="m-open">
+    <div class="modal">
+      <div class="modal-head">
+        <div><h3>Saved surveys</h3><p>Baselines archived from earlier missions. Open one to inspect it, or delete it.</p></div>
+        <button class="btn ghost small x" data-close type="button">Close</button>
       </div>
+      <div class="modal-body" id="mo-list"></div>
+    </div>
+  </div>
 
+  <!-- Save survey -->
+  <div class="modal-back" id="m-save">
+    <div class="modal narrow">
+      <div class="modal-head">
+        <div><h3>Save as baseline</h3><p>Keeps this model, mesh, flight log and camera poses for later comparison.</p></div>
+        <button class="btn ghost small x" data-close type="button">Close</button>
+      </div>
       <div class="modal-body">
-        <div class="option-group">
-          <label class="option-label">Baseline Designation / Sector Name</label>
-          <input type="text" id="baseline-name-input" placeholder="e.g., Sector 4 Forward Patrol Ground Truth (Day 1)" style="width: 100%; background: #06090e; border: 1px solid var(--panel-border); padding: 10px 12px; color: var(--text-main); font-size: 0.85rem; border-radius: 4px; outline: none; font-family: var(--font-mono);">
-        </div>
-
-        <div style="background: #111827; border: 1px solid var(--panel-border); padding: 12px; border-radius: 4px; font-size: 0.74rem; color: var(--text-muted); line-height: 1.5;">
-          <strong>Storage Management:</strong> PRISM optimizes memory by only archiving scans you explicitly approve as baseline ground truth. The active point cloud, mesh geometry, and flight telemetry will be securely referenced for future temporal comparisons.
-        </div>
+        <div class="field"><label for="ms-name">Name</label><input class="input" id="ms-name" type="text" maxlength="80"></div>
+        <label class="check"><input type="checkbox" id="ms-video" checked> Keep the video (needed for the video overlay later)</label>
+        <div class="callout caution hidden" id="ms-warn"></div>
       </div>
-
-      <div class="modal-footer">
-        <div class="footer-left">
-          <span>Active Model: <strong id="save-baseline-verts">Active Scan</strong></span>
-        </div>
-        <div style="display: flex; gap: 10px;">
-          <button id="confirm-save-baseline-btn" class="btn-tactical" type="button">
-            ARCHIVE BASELINE
-          </button>
-        </div>
-      </div>
+      <div class="modal-foot"><span class="spacer"></span><button class="btn primary" id="ms-save" type="button">Save baseline</button></div>
     </div>
   </div>
 
-  <!-- =================================================================
-       SAVED MODEL / BASELINE VIEWER MODAL
-       ================================================================= -->
-  <div id="load-baseline-modal" class="modal-backdrop">
-    <div class="tactical-modal" style="width: 680px;">
-      <div class="modal-header">
-        <div class="modal-title-group">
-          <h3>// LOAD SAVED MODEL / BASELINE</h3>
-          <p>Select an archived 3D tactical baseline to view directly in the main 3D viewport</p>
-        </div>
-        <button id="close-load-baseline-btn" class="modal-close-btn" type="button">✕</button>
+  <!-- Export centre -->
+  <div class="modal-back" id="m-export">
+    <div class="modal wide">
+      <div class="modal-head">
+        <div><h3>Export centre</h3><p id="mx-crs">—</p></div>
+        <button class="btn ghost small x" data-close type="button">Close</button>
       </div>
-
       <div class="modal-body">
-        <div class="option-group">
-          <div class="option-label">
-            <span>Archived 3D Baseline Models</span>
-            <span id="load-baseline-selected-hint" style="color: var(--accent-cyan);">Click a model to select</span>
-          </div>
-          <div id="load-baseline-list-container" class="baseline-list-box" style="max-height: 260px; overflow-y: auto;">
-            <div style="color: var(--text-muted); font-size: 0.75rem; padding: 10px; text-align: center;">Loading saved baselines...</div>
-          </div>
+        <div class="row export-offset">
+          <div class="grow note" id="mx-vertical"></div>
+          <label class="field" for="mx-offset" style="width: 210px;"><span>Take-off elevation, m (optional)</span>
+            <input class="input" id="mx-offset" type="number" step="0.01" placeholder="adds to every height"></label>
         </div>
-
-        <div style="background: #111827; border: 1px solid var(--panel-border); padding: 12px; border-radius: 4px; font-size: 0.74rem; color: var(--text-muted); line-height: 1.5;">
-          <strong>Main Screen Display:</strong> Selecting and displaying a saved model will load its exact 3D point cloud & metadata onto the main tactical viewport and update the telemetry HUD. You can return to the active mission recon scan at any time using the <em>"Return to Active Recon"</em> button in the viewport toolbar.
-        </div>
-      </div>
-
-      <div class="modal-footer">
-        <div class="footer-left">
-          <span>Selected: <strong id="load-baseline-selection-name" style="color: var(--accent-cyan);">None</strong></span>
-        </div>
-        <div style="display: flex; gap: 10px;">
-          <button id="cancel-load-baseline-btn" class="btn-tactical btn-secondary" type="button">
-            CANCEL
-          </button>
-          <button id="confirm-display-baseline-btn" class="btn-tactical" type="button" disabled>
-            DISPLAY ON MAIN SCREEN
-          </button>
-        </div>
+        <div id="mx-list"></div>
       </div>
     </div>
   </div>
 
-  <!-- =================================================================
-       MULTI-EPOCH 3D COMPARISON & CHANGE DETECTION MODAL
-       ================================================================= -->
-  <div id="compare-modal" class="modal-backdrop">
-    <div class="tactical-modal" style="width: 680px;">
-      <div class="modal-header">
-        <div class="modal-title-group">
-          <h3>// MULTI-EPOCH 3D CHANGE DETECTION & HEIGHT AUDIT</h3>
-          <p>Temporal Comparison Engine & Tactical Structural Anomaly Alerting (SIH26158)</p>
-        </div>
-        <button id="close-compare-btn" class="modal-close-btn" type="button">✕</button>
-      </div>
-
-      <div class="modal-body">
-        <!-- Baseline Selection List -->
-        <div class="option-group">
-          <div class="option-label">
-            <span>1. Select Baseline Model for Temporal Delta</span>
-            <span id="baseline-selected-hint" style="color: var(--accent-cyan);">None selected</span>
-          </div>
-          <div id="baseline-list-container" class="baseline-list-box">
-            <div style="color: var(--text-muted); font-size: 0.75rem; padding: 10px; text-align: center;">Loading archived baselines...</div>
-          </div>
-        </div>
-
-        <!-- Vertical Height Threshold Selector -->
-        <div class="option-group">
-          <div class="option-label">
-            <span>2. Vertical Structure Height Threshold (&Delta;h)</span>
-            <span id="thresh-hint" style="color: var(--accent-amber);">&ge; 1.5m (Standard Military)</span>
-          </div>
-          <div class="option-pills quad">
-            <button id="thresh-10-btn" class="pill-btn" type="button" data-thresh="1.0">
-              <strong>1.0 Meter</strong>
-              <span class="sub">High Sensitivity (Small Barricades / Tents)</span>
-            </button>
-            <button id="thresh-15-btn" class="pill-btn active" type="button" data-thresh="1.5">
-              <strong>1.5 Meters</strong>
-              <span class="sub">Standard (Tents, Shelters, Vehicles)</span>
-            </button>
-            <button id="thresh-25-btn" class="pill-btn" type="button" data-thresh="2.5">
-              <strong>2.5 Meters</strong>
-              <span class="sub">Fortifications & Outposts</span>
-            </button>
-            <button id="thresh-35-btn" class="pill-btn" type="button" data-thresh="3.5">
-              <strong>3.5 Meters</strong>
-              <span class="sub">Watchtowers & Radar Masts</span>
-            </button>
-          </div>
-        </div>
-
-        <!-- Disjoint Warning Box -->
-        <div id="compare-disjoint-warning" class="disjoint-box">
-          <div style="display: flex; align-items: center; gap: 8px; font-weight: 600;">
-            <span>DISJOINT LOCATIONS DETECTED (ZERO SPATIAL OVERLAP)</span>
-          </div>
-          <p id="disjoint-warning-text">The selected baseline sortie and active recon sortie have zero intersecting geographic coverage.</p>
-        </div>
-      </div>
-
-      <div class="modal-footer">
-        <div class="footer-left">
-          <span>Engine: <strong>M3C2 / 2.5D Elevation Diff & ICP</strong></span>
-        </div>
-        <div style="display: flex; gap: 10px;">
-          <button id="run-compare-btn" class="btn-tactical" type="button">
-            INITIATE 3D CHANGE DETECTION
-          </button>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <!-- =================================================================
-       CLEAN & SIMPLE MESHIFY PROGRESS BAR
-       ================================================================= -->
-  <div id="meshify-progress-modal" class="modal-backdrop">
-    <div class="meshify-simple-card">
-      <div class="meshify-simple-header">
-        <span class="meshify-simple-title">Meshify 3D Surface</span>
-        <span id="meshify-percent-num" class="meshify-simple-pct">0%</span>
-      </div>
-      <div class="meshify-simple-track">
-        <div id="meshify-progress-fill" class="meshify-simple-fill" style="width: 0%;"></div>
-      </div>
-      <div class="meshify-simple-footer">
-        <span id="meshify-stage-title" class="meshify-simple-status">Connecting surface points & filling gaps...</span>
-        <span id="meshify-elapsed-timer" class="meshify-simple-timer">00:00.0s</span>
-      </div>
-    </div>
-  </div>
-
-  <!-- =================================================================
-       HEIGHT RESTRICTION INPUT MODAL (CLEAN & SIMPLE)
-       ================================================================= -->
-  <div id="height-restriction-modal" class="modal-backdrop">
-    <div class="tactical-modal" style="width: 420px;">
-      <div class="modal-header">
-        <div class="modal-title-group">
-          <h3>Height Restriction</h3>
-          <p>Highlight points and structures above a specified height</p>
-        </div>
-        <button id="close-height-modal-btn" class="modal-close-btn" type="button">✕</button>
-      </div>
-
-      <div class="modal-body" style="padding: 18px 20px; display: flex; flex-direction: column; gap: 14px;">
-        <div>
-          <label style="font-size: 0.78rem; font-weight: 600; color: var(--text-muted); display: block; margin-bottom: 8px;">
-            Maximum Allowed Height:
-          </label>
-          <div style="display: flex; gap: 10px; align-items: center;">
-            <input type="number" id="height-number-input" min="0.2" max="100.0" step="0.5" value="5.0"
-              style="width: 100px; background: #06090e; border: 1px solid var(--panel-border); padding: 8px 12px; color: var(--accent-amber); font-size: 1.15rem; font-weight: 700; border-radius: 4px; outline: none; font-family: var(--font-mono); text-align: center;">
-            <span style="color: var(--text-main); font-size: 0.9rem; font-weight: 600;">meters</span>
-          </div>
-        </div>
-
-        <div>
-          <span style="font-size: 0.70rem; color: var(--text-muted); display: block; margin-bottom: 6px;">Quick Presets:</span>
-          <div style="display: flex; gap: 8px;">
-            <button class="pill-btn height-preset-btn" type="button" data-height="2.0" style="padding: 5px 12px; font-size: 0.78rem; font-weight: 600;">2m</button>
-            <button class="pill-btn active height-preset-btn" type="button" data-height="5.0" style="padding: 5px 12px; font-size: 0.78rem; font-weight: 600;">5m</button>
-            <button class="pill-btn height-preset-btn" type="button" data-height="10.0" style="padding: 5px 12px; font-size: 0.78rem; font-weight: 600;">10m</button>
-            <button class="pill-btn height-preset-btn" type="button" data-height="15.0" style="padding: 5px 12px; font-size: 0.78rem; font-weight: 600;">15m</button>
-          </div>
-        </div>
-      </div>
-
-      <div class="modal-footer" style="padding: 12px 20px; justify-content: flex-end; gap: 10px;">
-        <button id="cancel-height-modal-btn" class="btn-clean" type="button">Cancel</button>
-        <button id="confirm-height-restriction-btn" class="btn-tactical" style="background: var(--accent-amber); color: #000; font-weight: 700;" type="button">
-          Apply
-        </button>
-      </div>
-    </div>
-  </div>
-
-  <!-- Tactical Toast Notification -->
-  <div id="tactical-toast" class="tactical-toast">TACTICAL NOTIFICATION</div>
-
-  <!-- Primary Application Logic -->
-  <script src="js/viewer.js"></script>
+  <div class="toast-host" id="toasts"></div>
+  <script type="module" src="js/app.js"></script>
 </body>
-
 </html>
