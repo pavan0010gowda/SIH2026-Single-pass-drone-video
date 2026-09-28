@@ -20,13 +20,13 @@ try:
     from georeference import (georeference_reconstruction, read_colmap_images, read_colmap_points3d,
                               load_point_cloud, save_point_cloud, apply_transform, transform_normals,
                               georef_transform, natural_key, EXPORT_DISPLAY_MODEL_METRIC,
-                              DEFAULT_ASSUMED_ALTITUDE_M)
+                              DEFAULT_ASSUMED_ALTITUDE_M, metric_camera_frames)
 except ImportError:
     from backend.telemetry_parser import auto_detect_and_parse_telemetry, generate_fallback_telemetry
     from backend.georeference import (georeference_reconstruction, read_colmap_images, read_colmap_points3d,
                                       load_point_cloud, save_point_cloud, apply_transform, transform_normals,
                                       georef_transform, natural_key, EXPORT_DISPLAY_MODEL_METRIC,
-                                      DEFAULT_ASSUMED_ALTITUDE_M)
+                                      DEFAULT_ASSUMED_ALTITUDE_M, metric_camera_frames)
 
 DATA_DIR = os.path.join(PROJECT_ROOT, "data")
 WORKSPACE_DIR = os.path.join(DATA_DIR, "workspace")
@@ -75,24 +75,37 @@ def _colmap_env(colmap_cmd):
     return env
 
 
-def generate_blender_surface_mesh(input_ply_path, output_ply_path=None, output_obj_path=None, depth=10):
+def generate_blender_surface_mesh(input_ply_path, output_ply_path=None, output_obj_path=None, depth=None,
+                                  baseline_id=None, output_glb_path=None, progress=None, log=print):
     """
-    Executes High-Precision Photogrammetric Surface Reconstruction with Automated Hole & Gap Filling.
-    PRESERVES 100% RECOGNIZABLE DRONE GEOMETRY:
-    - Retains 1:1 original photogrammetry vertices for crisp house walls, flat roofs, paths, and trees.
-    - Uses adaptive multi-scale Ball Pivoting (BPA) matching natural drone camera resolution.
-    - Automated topological boundary traversal detects and fills interior swiss-cheese gaps/holes.
-    - Directly preserves 1:1 photographic RGB colors from the video frames.
-    - Zero melting/blobs, zero distortion of structures, zero bridging across open air.
+    Gap-free, geometry-faithful surface mesh (see mesh_builder.py): terrain-aware gap filling,
+    camera-oriented normals, tiled screened Poisson at the point spacing, support trimming.
+    Falls back to the legacy ball-pivoting mesher when the terrain model cannot be built.
     """
-    import open3d as o3d
-    import numpy as np
-    from collections import defaultdict
-
     if output_ply_path is None:
         output_ply_path = input_ply_path
     if output_obj_path is None:
         output_obj_path = os.path.splitext(output_ply_path)[0] + ".obj"
+    try:
+        try:
+            import terrain as T
+            import mesh_builder as MB
+        except ImportError:
+            from backend import terrain as T
+            from backend import mesh_builder as MB
+        tm, _, telem = T.get_terrain(DATA_DIR, baseline_id=baseline_id, log=log)
+        return MB.build_mesh(input_ply_path, output_ply_path, output_obj_path, output_glb_path, tm=tm, telem=telem,
+                             depth=depth, progress=progress, log=log)
+    except Exception as e:
+        log(f"[Mesh] terrain-aware mesher unavailable ({type(e).__name__}: {e}); using ball pivoting")
+        return _legacy_bpa_mesh(input_ply_path, output_ply_path, output_obj_path)
+
+
+def _legacy_bpa_mesh(input_ply_path, output_ply_path, output_obj_path):
+    """Previous multi-scale ball-pivoting mesher with fan hole filling (kept as a fallback)."""
+    import open3d as o3d
+    import numpy as np
+    from collections import defaultdict
 
     if not os.path.exists(input_ply_path):
         raise FileNotFoundError(f"Source point cloud not found at {input_ply_path}")
@@ -211,6 +224,9 @@ class PipelineManager:
         self.end_time = None
         self.process = None
         self.active_params = {}
+        self.stage_marks = []          # (stage name, start time) for the processing report
+        self.extras = {}
+        self.video_info = {}
 
     def get_status(self):
         with self.lock:
@@ -243,6 +259,8 @@ class PipelineManager:
         with self.lock:
             self.current_stage = stage_name
             self.progress_percent = progress
+            if not self.stage_marks or self.stage_marks[-1][0] != stage_name:
+                self.stage_marks.append((stage_name, time.time()))
         self.add_log(f"STAGE: {stage_name} ({progress}%)")
 
     def cancel(self):
@@ -260,7 +278,7 @@ class PipelineManager:
         return True
 
     def start_pipeline(self, input_type, has_telemetry, quality, media_path, telemetry_path=None,
-                       flight_altitude_m=None):
+                       flight_altitude_m=None, extras=None):
         with self.lock:
             if self.status == "running":
                 return False, "A reconstruction job is already actively running."
@@ -273,6 +291,9 @@ class PipelineManager:
             self.job_id = f"recon_{int(time.time())}"
             self.start_time = time.time()
             self.end_time = None
+            self.stage_marks = []
+            self.extras = dict(extras or {})
+            self.video_info = {}
             self.active_params = {
                 "input_type": input_type,
                 "has_telemetry": has_telemetry,
@@ -305,15 +326,16 @@ class PipelineManager:
                 fp = os.path.join(IMAGES_DIR, f)
                 if os.path.isfile(fp):
                     os.remove(fp)
-            if os.path.exists(FRAME_INDEX_PATH):
-                os.remove(FRAME_INDEX_PATH)
-            # Invalidate any old road audit from previous missions so user can compile on-demand
-            old_audit = os.path.join(DATA_DIR, "road_pothole_audit.json")
-            if os.path.exists(old_audit):
-                try:
-                    os.remove(old_audit)
-                except Exception:
-                    pass
+            for stale_index in (FRAME_INDEX_PATH, os.path.join(WORKSPACE_DIR, "frame_index_raw.json")):
+                if os.path.exists(stale_index):
+                    os.remove(stale_index)
+            # Invalidate the previous mission's road audit and processing report
+            for old in (os.path.join(DATA_DIR, "road_pothole_audit.json"), os.path.join(DATA_DIR, "recon_report.json")):
+                if os.path.exists(old):
+                    try:
+                        os.remove(old)
+                    except Exception:
+                        pass
 
             if input_type == "video":
                 frame_count = self._process_video_input(media_path, quality)
@@ -331,13 +353,25 @@ class PipelineManager:
             target_telemetry_json = os.path.join(DATA_DIR, "flight_telemetry.json")
             assumed_alt = float(flight_altitude_m) if flight_altitude_m else DEFAULT_ASSUMED_ALTITUDE_M
 
+            # the subtitle log of the previous mission must not be paired with this one
+            for stale_srt in (os.path.join(DATA_DIR, "drone_flight.srt"), os.path.join(RAW_VIDEOS_DIR, "drone_flight.srt")):
+                if os.path.exists(stale_srt):
+                    try:
+                        os.remove(stale_srt)
+                    except OSError:
+                        pass
             if has_telemetry and telemetry_path and os.path.exists(telemetry_path):
+                if telemetry_path.lower().endswith((".srt", ".txt")):
+                    os.makedirs(RAW_VIDEOS_DIR, exist_ok=True)
+                    shutil.copy2(telemetry_path, os.path.join(DATA_DIR, "drone_flight.srt"))
+                    shutil.copy2(telemetry_path, os.path.join(RAW_VIDEOS_DIR, "drone_flight.srt"))
                 self.add_log(f"Parsing uploaded coordinates/telemetry: {os.path.basename(telemetry_path)}")
                 auto_detect_and_parse_telemetry(telemetry_path, target_telemetry_json, frame_count, assumed_alt)
             else:
                 self.add_log("No coordinate file provided. Metric scale will come from the flight altitude "
                              f"({assumed_alt:.1f} m above ground{' - ASSUMED' if not flight_altitude_m else ''}).")
                 generate_fallback_telemetry(frame_count, target_telemetry_json, total_distance=125.0, altitude=assumed_alt)
+            self._apply_optional_sensors(target_telemetry_json, telemetry_path)
 
             # -------------------------------------------------------------
             # STAGE 3: Clean Reconstruction Cache (30% - 35%)
@@ -386,6 +420,10 @@ class PipelineManager:
             ]
             if is_fast_mode:
                 cmd_args.extend(["--dense", "0"])
+            cmd_args.extend(self._camera_args())
+            mask_dir = self._write_feature_masks()
+            if mask_dir:
+                cmd_args.extend(["--mask_path", mask_dir])
 
             self.add_log(f"Executing: {' '.join(cmd_args)}")
 
@@ -439,9 +477,19 @@ class PipelineManager:
             # -------------------------------------------------------------
             self.set_stage("DEPLOYING 3D DIGITAL TWIN", 90)
             os.makedirs(MODELS_DIR, exist_ok=True)
-            for stale in (MEASUREMENT_CLOUD, RAW_MODEL):
+            # derived files of the previous mission must not be shown with the new model
+            for stale in (MEASUREMENT_CLOUD, RAW_MODEL, os.path.join(MODELS_DIR, "actionable_threat_mesh.ply"),
+                          os.path.join(MODELS_DIR, "actionable_threat_mesh.obj"),
+                          os.path.join(MODELS_DIR, "actionable_threat_mesh.glb"),
+                          os.path.join(MODELS_DIR, "actionable_threat_map_diff.ply"),
+                          os.path.join(MODELS_DIR, "terrain_cache.npz"),
+                          os.path.join(MODELS_DIR, "checkpoints.json"),
+                          os.path.join(MODELS_DIR, "buildings_cache.json")):
                 if os.path.exists(stale):
-                    os.remove(stale)
+                    try:
+                        os.remove(stale)
+                    except OSError:
+                        pass
 
             candidates = [
                 (os.path.join(WORKSPACE_DIR, "dense", "0", "fused.ply"), ["dense/0/sparse", "sparse/0"]),
@@ -493,13 +541,15 @@ class PipelineManager:
             # STAGE 7: ULTRA mode solid mesh (display only)
             # -------------------------------------------------------------
             if quality == "ultra":
-                self.set_stage("GENERATING BLENDER SOLID 3D MESH", 94)
-                self.add_log("ULTRA MODE ACTIVE: Initiating Open3D Poisson Surface Reconstruction & Blender Mesh Synthesis...")
+                self.set_stage("BUILDING GAP-FREE SURFACE MESH", 94)
+                self.add_log("ULTRA mode: terrain-aware gap filling + tiled screened Poisson surface...")
                 try:
                     obj_target = os.path.join(MODELS_DIR, "actionable_threat_mesh.obj")
                     mesh_ply_target = os.path.join(MODELS_DIR, "actionable_threat_mesh.ply")
+                    glb_target = os.path.join(MODELS_DIR, "actionable_threat_mesh.glb")
                     src_cloud = POINTS_MODEL if os.path.exists(POINTS_MODEL) else DISPLAY_MODEL
-                    stats = generate_blender_surface_mesh(src_cloud, mesh_ply_target, obj_target)
+                    stats = generate_blender_surface_mesh(src_cloud, mesh_ply_target, obj_target,
+                                                          output_glb_path=glb_target, log=self.add_log)
                     self.add_log(f"Blender 3D Mesh successfully synthesized: {stats['vertices']:,} vertices, {stats['triangles']:,} polygonal faces.")
                     self.add_log(f"Exported Blender Wavefront model: {os.path.basename(obj_target)} ({os.path.getsize(obj_target):,} bytes).")
                     self.add_log("Point cloud preserved in full resolution for instant, accurate dots view.")
@@ -512,6 +562,10 @@ class PipelineManager:
                 self.current_stage = "COMPLETED"
                 self.end_time = time.time()
                 elapsed = round(self.end_time - (self.start_time or self.end_time), 1)
+            try:
+                self._write_recon_report(quality, frame_count, model_dirs)
+            except Exception as rep_err:
+                self.add_log(f"Notice: processing report not written ({rep_err})")
 
             self.add_log(f"MISSION PIPELINE COMPLETE in {elapsed}s! 3D Model ready for live tactical inspection.")
 
@@ -521,6 +575,150 @@ class PipelineManager:
                 self.error = str(err)
                 self.end_time = time.time()
             self.add_log(f"ERROR: Pipeline execution failed: {err}")
+
+    # -----------------------------------------------------------------
+    # optional sensor inputs, masks, processing report
+    # -----------------------------------------------------------------
+    def _apply_optional_sensors(self, telemetry_json, srt_path):
+        """IMU / flight-record CSV (gimbal, attitude) and RTK / PPK positions into the telemetry."""
+        try:
+            import sensors
+        except ImportError:
+            from backend import sensors
+        with open(telemetry_json, "r", encoding="utf-8") as f:
+            telem = json.load(f)
+        imu = self.extras.get("imu_path")
+        if imu and os.path.exists(imu):
+            try:
+                rows, info = sensors.parse_flight_csv(imu)
+                gp = [r["gimbal_pitch"] for r in rows if "gimbal_pitch" in r]
+                if gp:
+                    telem["gimbal_pitch_median_deg"] = round(float(np.median(gp)), 2)
+                telem["attitude_records"] = sum("pitch" in r for r in rows)
+                if not telem.get("waypoints") or telem.get("is_synthetic"):
+                    telem["waypoints"] = [{"frame_id": i, "latitude": r["lat"], "longitude": r["lon"],
+                                           "time_s": round(r["time_s"], 3),
+                                           **({"relative_altitude_m": round(r["rel"], 3)} if "rel" in r else {})}
+                                          for i, r in enumerate(rows) if r["time_s"] >= -1.0]
+                    telem.update(source="FLIGHT_CSV", is_synthetic=False, has_timestamps=True, altitude_reference="relative",
+                                 latlon_ambiguous=False, latlon_order="explicit", waypoint_count=len(telem["waypoints"]))
+                self.add_log(f"Flight log {os.path.basename(imu)}: {info['rows']} rows, attitude={info['has_attitude']}, "
+                             f"gimbal={info['has_gimbal']}, recording start {'found' if info['recording_start_found'] else 'assumed at log start'}.")
+            except Exception as e:
+                self.add_log(f"WARNING: flight log CSV not used ({e})")
+        rtk_path = self.extras.get("rtk_path")
+        if rtk_path and os.path.exists(rtk_path):
+            try:
+                rtk = sensors.parse_rtk_file(rtk_path)
+                telem, summ = sensors.rtk_waypoints(telem, rtk, srt_path if (srt_path and srt_path.lower().endswith((".srt", ".txt"))) else None)
+                self.add_log(f"RTK/PPK: {summ['position_source']} ({summ['fix_pct']}% fixed), clock offset "
+                             f"{summ['clock_offset_s']:.2f} s, tracks agree to {summ['track_match_median_m']} m.")
+            except Exception as e:
+                self.add_log(f"WARNING: RTK/PPK file not used ({e})")
+        with open(telemetry_json, "w", encoding="utf-8") as f:
+            json.dump(telem, f, indent=2)
+
+    def _camera_args(self):
+        path = self.extras.get("intrinsics_path")
+        if not path or not os.path.exists(path):
+            return []
+        try:
+            import sensors
+        except ImportError:
+            from backend import sensors
+        try:
+            K = sensors.parse_intrinsics(path)
+            first = next((f for f in sorted(os.listdir(IMAGES_DIR)) if f.lower().endswith(IMAGE_EXTS)), None)
+            img = cv2.imread(os.path.join(IMAGES_DIR, first)) if first else None
+            if img is None:
+                return []
+            model, params = sensors.intrinsics_for_size(K, img.shape[1], img.shape[0])
+            self.extras["intrinsics_source"] = f"{K['source']} ({model}, used as the prior)"
+            self.add_log(f"Camera calibration: {model} {', '.join(f'{p:.4f}' for p in params)}")
+            return ["--camera_model", model, "--camera_params", ",".join(f"{p:.6f}" for p in params)]
+        except Exception as e:
+            self.add_log(f"WARNING: camera calibration not used ({e})")
+            return []
+
+    def _write_feature_masks(self):
+        """Sky + vehicles / people / animals kept out of feature matching (COLMAP --mask_path)."""
+        if not self.extras.get("dynamic_masks", True):
+            return None
+        try:
+            import masks as MK
+        except ImportError:
+            from backend import masks as MK
+        names = [f for f in sorted(os.listdir(IMAGES_DIR)) if f.lower().endswith(IMAGE_EXTS)]
+        mask_dir = os.path.join(WORKSPACE_DIR, "masks")
+        shutil.rmtree(mask_dir, ignore_errors=True)
+        instances = {}
+        try:
+            det = MK.load_detector(log=self.add_log)
+            if det is not None:
+                self.set_stage("MASKING VEHICLES / PEOPLE / ANIMALS", 33)
+                instances = MK.detect_instances(det, [os.path.join(IMAGES_DIR, n) for n in names])
+                MK.save_instances(os.path.join(WORKSPACE_DIR, "instances.json"), instances)
+            else:
+                self.add_log("Dynamic-object detection unavailable (pip install ultralytics to enable); sky masks only.")
+        except Exception as e:
+            self.add_log(f"Notice: dynamic-object detection skipped ({e})")
+        st = MK.write_masks(IMAGES_DIR, names, mask_dir, instances=instances)
+        self.extras["mask_stats"] = dict(st, **MK.summarise(instances))
+        if st["sky_frames"] == 0 and st["masked_instances"] == 0:
+            return None
+        self.add_log(f"Feature masks: sky in {st['sky_frames']}/{st['frames']} frames, {st['masked_instances']} dynamic objects.")
+        return mask_dir
+
+    def _write_recon_report(self, quality, frame_count, model_dirs):
+        marks = list(self.stage_marks) + [("END", self.end_time or time.time())]
+        timings = [{"stage": a[0].title(), "seconds": round(b[1] - a[1], 1), "note": ""} for a, b in zip(marks[:-1], marks[1:])]
+        sfm = {}
+        try:
+            md = self._find_camera_model(model_dirs or [], find_colmap())
+            if md:
+                imgs = read_colmap_images(md)
+                pts, _ = read_colmap_points3d(md)
+                sfm = {"num_images": frame_count, "num_registered": len(imgs), "num_points": len(pts),
+                       "camera_model": "COLMAP automatic_reconstructor"}
+        except Exception:
+            pass
+        n_pts = None
+        src = POINTS_MODEL if os.path.exists(POINTS_MODEL) else DISPLAY_MODEL
+        try:
+            try:
+                import plyio
+            except ImportError:
+                from backend import plyio
+            n_pts = plyio.ply_counts(src)[0]
+        except Exception:
+            pass
+        gpu = ""
+        try:
+            r = subprocess.run(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"], capture_output=True, text=True, timeout=10)
+            gpu = r.stdout.strip().splitlines()[0] if r.returncode == 0 and r.stdout.strip() else ""
+        except Exception:
+            pass
+        vi = self.video_info or {}
+        report = {
+            "engine": "PRISM local (COLMAP automatic_reconstructor)", "hardware": {"gpu_name": gpu, "cpu": os.cpu_count()},
+            "profile": {"quality": quality}, "video": vi, "ingest": {"keyframes": frame_count},
+            "sfm": sfm, "timings": timings, "total_seconds": round((self.end_time or time.time()) - (self.start_time or time.time()), 1),
+            "outputs": {"points": n_pts}, "inputs": {k: v for k, v in self.extras.items() if k != "mask_stats"},
+            "dynamic_objects": (self.extras.get("mask_stats") or {}), "warnings": [],
+        }
+        if vi.get("duration"):
+            ratio = report["total_seconds"] / vi["duration"]
+            report["sih_time"] = {"ratio": round(ratio, 2), "minutes_per_10_min_video": round(10 * ratio, 1),
+                                  "target_met": bool(ratio <= 1.5)}
+        with open(os.path.join(DATA_DIR, "recon_report.json"), "w", encoding="utf-8") as f:
+            json.dump(report, f, indent=1, default=str)
+        telem_path = os.path.join(DATA_DIR, "flight_telemetry.json")
+        if self.extras.get("intrinsics_source") and os.path.exists(telem_path):
+            with open(telem_path, "r", encoding="utf-8") as f:
+                telem = json.load(f)
+            telem["intrinsics_source"] = self.extras["intrinsics_source"]
+            with open(telem_path, "w", encoding="utf-8") as f:
+                json.dump(telem, f, indent=2)
 
     def _find_best_sparse_model(self, workspace_dir):
         """Scans all sparse sub-models in workspace/sparse and returns the one with the most points."""
@@ -568,9 +766,13 @@ class PipelineManager:
             with open(telemetry_json_path, "r", encoding="utf-8") as f:
                 telem = json.load(f)
         frame_info = None
-        if os.path.exists(FRAME_INDEX_PATH):
-            with open(FRAME_INDEX_PATH, "r", encoding="utf-8") as f:
-                frame_info = json.load(f)
+        raw_index = os.path.join(WORKSPACE_DIR, "frame_index_raw.json")
+        for p in (FRAME_INDEX_PATH, raw_index):
+            if os.path.exists(p):
+                with open(p, "r", encoding="utf-8") as f:
+                    frame_info = json.load(f)
+                if isinstance(frame_info, dict):      # timing index written at ingest
+                    break
         pts, nrm, col = None, None, None
         try:
             model_dir = self._find_camera_model(model_dirs, colmap_cmd)
@@ -603,6 +805,28 @@ class PipelineManager:
                          f"camera height above ground {diag.get('median_camera_height_above_ground_m', 'n/a')} m.")
             for w in geo.get("warnings", []):
                 self.add_log(f"WARNING: {w}")
+            # the flight log wrote GPS(lon, lat): store the corrected order permanently
+            if geo.get("latlon_swapped"):
+                try:
+                    from telemetry_parser import swap_latlon_in_telemetry
+                except ImportError:
+                    from backend.telemetry_parser import swap_latlon_in_telemetry
+                telem = swap_latlon_in_telemetry(telem)
+            if telem.get("latlon_ambiguous"):
+                telem["latlon_ambiguous"] = False
+                telem["latlon_verified"] = str(diag.get("latlon_order_resolved", "")).startswith(("as_logged", "swapped"))
+            # per-keyframe poses in the metric frame (video overlay, viewing-angle gating, recalibration)
+            try:
+                frames = metric_camera_frames(model_dir, t4, frame_info)
+                if frames:
+                    telem["camera_trajectory"] = [f["position"] for f in frames]
+                    if frame_info is not None:
+                        with open(os.path.join(WORKSPACE_DIR, "frame_index_raw.json"), "w", encoding="utf-8") as f:
+                            json.dump(frame_info, f, indent=1)
+                    with open(FRAME_INDEX_PATH, "w", encoding="utf-8") as f:
+                        json.dump(frames, f, indent=1)
+            except Exception as e:
+                self.add_log(f"Notice: camera poses not exported ({e})")
         else:
             shutil.copy2(RAW_MODEL, DISPLAY_MODEL)
             telem.pop("metric_scale_factor", None)
@@ -634,6 +858,8 @@ class PipelineManager:
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
         duration_sec = total_frames / fps
+        self.video_info = {"width": int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), "height": int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+                           "fps": round(float(fps), 3), "duration": round(duration_sec, 2)}
         self.add_log(f"Video Stats: {total_frames} frames, {fps:.2f} FPS (~{duration_sec:.1f} sec)")
 
         target_count = 60

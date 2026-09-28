@@ -1,4 +1,28 @@
 ================================================================================
+PRISM // GOOGLE COLAB GUIDE  (read this part first)
+================================================================================
+Recommended notebook: colab/prism_turbo_reconstruction.ipynb  (PRISM-TURBO 1.2)
+
+1. Colab: File > Upload notebook > prism_turbo_reconstruction.ipynb.
+   Runtime > Change runtime type > T4 GPU (L4 / A100 are faster). Run Cell 1 (setup).
+2. Put the video and its DJI .SRT in Google Drive with the same name
+   (DJI_0001.MP4 + DJI_0001.SRT). Cell 3: set DRIVE_VIDEO_PATH; the .SRT is found automatically.
+   Optional in Cell 3:
+     RTK_PATH        RTK / PPK positions (RTKLIB .pos or CSV: time, lat, lon, height, Q)
+                     -> centimetre-level georeference; the clock offset is found automatically
+     INTRINSICS_PATH camera calibration (OpenCV YAML/JSON or COLMAP cameras.txt), fixed in the adjustment
+3. Cell 4: QUALITY = "sih" meets the NTRO target (10-minute video in < 15 minutes) on a T4.
+   "balanced" / "max" take longer for denser models. No flight altitude is asked: it is read from the log.
+   DYNAMIC_OBJECT_MASKS = True removes moving vehicles, people and animals (parked ones stay).
+   The last lines print the processing time per 10 minutes of video and the dynamic-object summary.
+4. Cell 5 copies prism_colab_bundle.zip to Drive and downloads it.
+   PRISM dashboard: Mission > New mission > Colab package > drop the zip.
+5. After import: Analyze > Quality & accuracy shows the SIH targets and lets you add check points;
+   Mission > Export centre gives LAS, GeoTIFF, glTF, FBX, OBJ, PLY, GeoJSON and CityJSON.
+
+The rest of this file describes the original notebook (prism_reconstruction.ipynb), kept for reference.
+
+================================================================================
 PRISM // GOOGLE COLAB CLOUD GPU 3D RECONSTRUCTION GUIDE
 Heavy Photogrammetry Offloader for Large (3.5GB+) 4K Drone Videos
 ================================================================================

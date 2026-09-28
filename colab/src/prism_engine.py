@@ -7,9 +7,14 @@
 #          PRISM Colab pipeline, plus a few extras)
 #
 #  Pipeline (every heavy stage is on the GPU or strictly time-budgeted):
-#    1. INGEST  one ffmpeg pass: NVDEC decode -> scale_cuda -> {NVENC web video,
-#               keyframe candidates}.  Streaming keyframe selector chooses the
-#               sharpest frame per motion-adaptive window (KLT parallax).
+#    1. INGEST  one ffmpeg pass: NVDEC decode with in-decoder resize (cuvid) or
+#               scale_cuda -> {NVENC web video, keyframe candidates}. Streaming
+#               keyframe selector chooses the sharpest frame per motion-adaptive
+#               window (KLT parallax).
+#    1b MASKS   sky (horizon fit) + vehicles / people / animals (YOLO-seg). All
+#               of them are kept out of feature matching; after SfM an epipolar
+#               motion test keeps parked objects and removes only MOVING ones
+#               from depth fusion (no ghosts, no torn roads).
 #    2. SfM     pycolmap-cuda12: GPU SIFT, GPU matching (sequential + loop /
 #               GPS-spatial pairs), view-graph focal calibration, GLOBAL mapper
 #               (GLOMAP) with incremental fallback.
@@ -46,7 +51,7 @@ from dataclasses import asdict, dataclass, field
 
 import numpy as np
 
-ENGINE_VERSION = "prism-turbo 1.1 (pycolmap 4.2)"
+ENGINE_VERSION = "prism-turbo 1.2 (pycolmap 4.2)"
 ENGINE_PATH = os.path.abspath(__file__)
 _T0 = time.time()
 
@@ -184,6 +189,10 @@ class Config:
     focal_35mm: float = 0.0                 # override 35mm-equivalent focal (0 -> SRT / auto)
     assumed_altitude_m: float = 0.0         # 0 = automatic: GPS track, else the altitude in the log; only
                                             # a flight with NO log at all falls back to 30 m (LOW confidence)
+    # optional sensor inputs
+    rtk_path: str = ""                      # RTK / PPK positions (RTKLIB .pos or CSV) -> cm-level georeference
+    intrinsics_path: str = ""               # lab calibration (OpenCV YAML/JSON, COLMAP cameras.txt); fixed in BA
+    dynamic_masks: bool = True              # vehicles / people / animals: kept out of SfM; moving ones not fused
     # dense
     mvs_max_size: int = 0                   # 0 -> auto
     mvs_num_sources: int = 0                # 0 -> auto
@@ -218,6 +227,8 @@ PROFILES = {
 
 QUALITY = {
     # PatchMatch settings (COLMAP 'medium' style: window step 2 => ~5x faster than default)
+    # sih: problem-statement mode - budget = 1.4 x video length (6-14 min), fewer keyframes / iterations
+    "sih": dict(minutes=14.0, win_radius=4, num_samples=8, it_photo=4, it_geo=2, scale=0.8),
     "fast": dict(minutes=12.0, win_radius=4, num_samples=8, it_photo=4, it_geo=2, scale=0.85),
     "balanced": dict(minutes=18.0, win_radius=4, num_samples=10, it_photo=5, it_geo=3, scale=1.0),
     "max": dict(minutes=24.0, win_radius=5, num_samples=12, it_photo=5, it_geo=3, scale=1.15),
@@ -900,11 +911,15 @@ def _x264_args(fps):
 
 
 def build_ingest_cmd(vinfo, variant, kf_wh, step, web=None, t_limit=None):
-    """variant: cuda_full | cuda_dl | nvdec_sw | cpu.  web: dict(path, wh) or None (NVENC inline)."""
+    """variant: cuvid_resize | cuda_full | cuda_dl | nvdec_sw | cpu.  web: dict(path, wh) or None (NVENC inline)."""
     kw, kh = kf_wh
     cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-nostats", "-y"]
     cmd += ["-loglevel", "info"] if variant == "cpu_keyframes" else ["-loglevel", "error"]
-    if variant in ("cuda_full", "cuda_dl"):
+    if variant == "cuvid_resize":
+        # NVDEC scales inside the decoder: only keyframe-size frames ever reach system memory, so the
+        # 2 vCPUs of a Colab T4 no longer limit the decode rate (4K -> 1080p costs nothing)
+        cmd += ["-c:v", {"h264": "h264_cuvid", "hevc": "hevc_cuvid"}[vinfo["codec"]], "-resize", f"{kw}x{kh}"]
+    elif variant in ("cuda_full", "cuda_dl"):
         cmd += ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda", "-extra_hw_frames", "24"]
     elif variant == "nvdec_sw":
         cmd += ["-hwaccel", "cuda"]
@@ -917,7 +932,15 @@ def build_ingest_cmd(vinfo, variant, kf_wh, step, web=None, t_limit=None):
     cmd += ["-i", vinfo["path"]]
     fs = f"framestep={step}" if step > 1 else "null"
     g = []
-    if variant in ("cuda_full", "cuda_dl"):
+    if variant == "cuvid_resize":
+        kf_chain = f"{fs},format=nv12"
+        if web:
+            ww, wh = web["wh"]
+            web_chain = "format=nv12" if (ww, wh) == (kw, kh) else f"scale={ww}:{wh}:flags=bilinear,format=nv12"
+            g.append(f"[0:v]split=2[a][b];[a]{kf_chain}[kf];[b]{web_chain}[web]")
+        else:
+            g.append(f"[0:v]{kf_chain}[kf]")
+    elif variant in ("cuda_full", "cuda_dl"):
         sk = f"scale_cuda=w={kw}:h={kh}:format=nv12:interp_algo=bicubic"
         if variant == "cuda_full":
             kf_chain = f"{fs},{sk},hwdownload,format=nv12"
@@ -1009,6 +1032,8 @@ def ingest_video(cfg, prof, vinfo, dirs):
     cpu_decode_s = vinfo["frames"] * (vinfo["width"] * vinfo["height"] / 2.07e6) / (55.0 * max(1, prof.get("cpu", 2)) / 2)
     cpu_order = ["cpu_keyframes", "cpu"] if cpu_decode_s > 0.2 * prof["target_s"] else ["cpu", "cpu_keyframes"]
     variants = ["cuda_full", "cuda_dl", "nvdec_sw"] + cpu_order
+    if vinfo["codec"] in ("h264", "hevc"):
+        variants = ["cuvid_resize"] + variants
     if vinfo["rotation"]:
         variants = ["nvdec_sw"] + cpu_order  # let ffmpeg auto-rotate software frames
     chosen, web_inline = None, None
@@ -1203,6 +1228,328 @@ def write_sky_masks(image_dir, names, mask_dir):
 
 
 # -----------------------------------------------------------------------------
+# dynamic objects (vehicles, people, animals): detection masks + epipolar motion test
+# -----------------------------------------------------------------------------
+DYNAMIC_CLASSES = {0: "person", 1: "bicycle", 2: "car", 3: "motorcycle", 5: "bus", 6: "train", 7: "truck", 8: "boat",
+                   14: "bird", 15: "cat", 16: "dog", 17: "horse", 18: "sheep", 19: "cow", 20: "elephant", 21: "bear",
+                   22: "zebra", 23: "giraffe"}
+YOLO_WEIGHTS = ("yolo11n-seg.pt", "yolov8n-seg.pt")
+
+
+def _poly_mask(shape, poly, dilate_px=0):
+    import cv2
+    m = np.zeros(shape[:2], np.uint8)
+    cv2.fillPoly(m, [np.asarray(poly, np.int32)], 255)
+    if dilate_px > 0:
+        m = cv2.dilate(m, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * dilate_px + 1, 2 * dilate_px + 1)))
+    return m > 0
+
+
+def write_frame_masks(image_dir, names, mask_dir, instances=None, moving=None, dilate_frac=0.006):
+    """COLMAP masks: sky (when a horizon is visible) + dynamic instances (only moving / undecided ones
+    when `moving` is given). Returns counts."""
+    import cv2
+    ensure_dir(mask_dir)
+    n_sky = n_inst = 0
+    for n in names:
+        img = cv2.imread(os.path.join(image_dir, n))
+        if img is None:
+            continue
+        keep = sky_mask(img)
+        if keep is None:
+            keep = np.full(img.shape[:2], 255, np.uint8)
+        else:
+            n_sky += 1
+        dil = max(2, int(round(dilate_frac * max(img.shape[:2]))))
+        flags = (moving or {}).get(n) or []
+        for k, inst in enumerate((instances or {}).get(n, [])):
+            if moving is not None and k < len(flags) and flags[k] is False:
+                continue
+            keep[_poly_mask(img.shape, inst["poly"], dil)] = 0
+            n_inst += 1
+        cv2.imwrite(os.path.join(mask_dir, n + ".png"), keep)
+    return dict(frames=len(names), sky_frames=n_sky, masked_instances=n_inst)
+
+
+def _sampson(F, p1, p2):
+    x1 = np.c_[p1, np.ones(len(p1))]
+    x2 = np.c_[p2, np.ones(len(p2))]
+    Fx1, Ftx2 = x1 @ F.T, x2 @ F
+    num = np.einsum("ij,ij->i", x2, Fx1) ** 2
+    den = Fx1[:, 0] ** 2 + Fx1[:, 1] ** 2 + Ftx2[:, 0] ** 2 + Ftx2[:, 1] ** 2
+    return np.sqrt(num / np.maximum(den, 1e-12))
+
+
+def _lk_track(g1, g2, mask, max_pts=60):
+    import cv2
+    p = cv2.goodFeaturesToTrack(g1, maxCorners=max_pts, qualityLevel=0.01, minDistance=3,
+                                mask=mask.astype(np.uint8) * 255, blockSize=5)
+    if p is None or len(p) < 3:
+        return None, None
+    lk = dict(winSize=(21, 21), maxLevel=4, criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01))
+    q, st, _ = cv2.calcOpticalFlowPyrLK(g1, g2, p, None, **lk)
+    b, st2, _ = cv2.calcOpticalFlowPyrLK(g2, g1, q, None, **lk)
+    ok = (st.ravel() == 1) & (st2.ravel() == 1) & (np.linalg.norm((b - p).reshape(-1, 2), axis=1) < 0.7)
+    if ok.sum() < 3:
+        return None, None
+    return p.reshape(-1, 2)[ok], q.reshape(-1, 2)[ok]
+
+
+def motion_test(summ, image_dir, instances, min_px=2.5):
+    """
+    With the SfM poses the fundamental matrix between two keyframes is exact: a static object's
+    features obey x2' F x1 = 0 (whatever their height), a moving object's do not. Returns
+    {name: [True moving | False static | None undecided, ...]}.
+    """
+    import cv2
+    out = {}
+    order = sorted(range(summ.n), key=lambda i: summ.names[i])
+    pos = {i: k for k, i in enumerate(order)}
+    for name, inst in instances.items():
+        if not inst or name not in summ.index:
+            continue
+        i = summ.index[name]
+        k = pos[i]
+        j = order[k + 2] if k + 2 < len(order) else (order[k - 2] if k >= 2 else None)
+        if j is None:
+            out[name] = [None] * len(inst)
+            continue
+        R = summ.R[j] @ summ.R[i].T
+        tv = summ.T[j] - R @ summ.T[i]
+        tx = np.array([[0, -tv[2], tv[1]], [tv[2], 0, -tv[0]], [-tv[1], tv[0], 0]])
+        F = np.linalg.inv(summ.K[j]).T @ tx @ R @ np.linalg.inv(summ.K[i])
+        F /= np.linalg.norm(F) + 1e-12
+        a = cv2.imread(os.path.join(image_dir, name), cv2.IMREAD_GRAYSCALE)
+        b = cv2.imread(os.path.join(image_dir, summ.names[j]), cv2.IMREAD_GRAYSCALE)
+        if a is None or b is None:
+            out[name] = [None] * len(inst)
+            continue
+        masks = [_poly_mask(a.shape, q["poly"]) for q in inst]
+        union = np.zeros(a.shape, bool)
+        for m in masks:
+            union |= m
+        bg = ~cv2.dilate(union.astype(np.uint8), np.ones((15, 15), np.uint8)).astype(bool)
+        p, q = _lk_track(a, b, bg, max_pts=400)
+        if p is None:
+            out[name] = [None] * len(inst)
+            continue
+        bg_err = float(np.median(_sampson(F, p, q)))
+        if bg_err > 1.5:
+            out[name] = [None] * len(inst)
+            continue
+        thr = max(min_px, 4.0 * bg_err)
+        flags = []
+        for m in masks:
+            ero = cv2.erode(m.astype(np.uint8), np.ones((5, 5), np.uint8)).astype(bool)
+            pi, qi = _lk_track(a, b, ero if ero.sum() > 30 else m)
+            flags.append(None if pi is None or len(pi) < 4 else bool(np.median(_sampson(F, pi, qi)) > thr))
+        out[name] = flags
+    return out
+
+
+def dynamic_summary(instances, moving=None):
+    by, mov, stat, und = {}, 0, 0, 0
+    for n, lst in (instances or {}).items():
+        flags = (moving or {}).get(n) or []
+        for k, inst in enumerate(lst):
+            by[inst["label"]] = by.get(inst["label"], 0) + 1
+            f = flags[k] if k < len(flags) else None
+            mov += f is True
+            stat += f is False
+            und += f is None
+    return dict(detections=sum(by.values()), by_class=by, moving=mov, static=stat, undecided=und)
+
+
+# -----------------------------------------------------------------------------
+# optional sensor inputs: RTK / PPK positions, camera calibration
+# -----------------------------------------------------------------------------
+_DT_RE = re.compile(r"(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})[ T]+(\d{1,2}):(\d{2}):(\d{2}(?:\.\d+)?)")
+_GPS_EPOCH = 315964800.0
+
+
+def _dt_unix(s):
+    import calendar
+    m = _DT_RE.search(s)
+    if not m:
+        return None
+    y, mo, d, h, mi, sec = m.groups()
+    return calendar.timegm((int(y), int(mo), int(d), int(h), int(mi), 0)) + float(sec)
+
+
+def read_rtk(path):
+    """RTKLIB .pos (llh or ECEF; date/time or week/TOW) or CSV (time, lat, lon, height, Q) -> arrays."""
+    import csv
+    import io
+    with open(path, "r", errors="replace") as fh:
+        text = fh.read()
+    t, la, lo, h, q = [], [], [], [], []
+    if path.lower().endswith(".pos") or text.lstrip().startswith("%"):
+        ecef = "x-ecef" in text.lower()
+        for line in text.splitlines():
+            s = line.strip()
+            if not s or s.startswith("%"):
+                continue
+            tok = s.split()
+            try:
+                if "/" in tok[0]:
+                    tt, vals = _dt_unix(tok[0] + " " + tok[1]), tok[2:]
+                else:
+                    tt, vals = _GPS_EPOCH + int(tok[0]) * 604800.0 + float(tok[1]), tok[2:]
+                a, b, c = float(vals[0]), float(vals[1]), float(vals[2])
+                qq = int(vals[3]) if len(vals) > 3 else 0
+            except (ValueError, IndexError):
+                continue
+            if tt is None:
+                continue
+            if ecef:
+                p = np.hypot(a, b)
+                lon_ = math.degrees(math.atan2(b, a))
+                lat_ = math.atan2(c, p * (1 - _WGS_E2))
+                for _ in range(6):
+                    n_ = _WGS_A / math.sqrt(1 - _WGS_E2 * math.sin(lat_) ** 2)
+                    lat_ = math.atan2(c + _WGS_E2 * n_ * math.sin(lat_), p)
+                n_ = _WGS_A / math.sqrt(1 - _WGS_E2 * math.sin(lat_) ** 2)
+                a, b, c = math.degrees(lat_), lon_, p / math.cos(lat_) - n_
+            t.append(tt), la.append(a), lo.append(b), h.append(c), q.append(qq)
+        kind = "PPK"
+    else:
+        rows = [r for r in csv.reader(io.StringIO(text)) if r]
+        head = [c.strip().lower() for c in rows[0]]
+
+        def col(*names, avoid=()):
+            return next((i for i, c in enumerate(head) if any(n in c for n in names) and not any(x in c for x in avoid)), None)
+        it, ila, ilo = col("gpst", "utc", "time", "date"), col("lat"), col("lon", "lng")
+        ih, iq = col("ellips", "height", "alt", avoid=("sd", "std")), col("q", "fix", "quality", "status", avoid=("sd",))
+        if None in (it, ila, ilo):
+            raise ValueError("RTK CSV needs time, latitude and longitude columns")
+        for r in rows[1:]:
+            try:
+                ts = r[it].strip()
+                tt = (float(ts) / (1000.0 if float(ts) > 1e11 else 1.0)) if re.fullmatch(r"[-+]?\d+(\.\d+)?", ts) else _dt_unix(ts)
+                if tt is None:
+                    continue
+                qv = r[iq].strip().lower() if iq is not None else ""
+                t.append(tt), la.append(float(r[ila])), lo.append(float(r[ilo]))
+                h.append(float(r[ih]) if ih is not None and r[ih].strip() else float("nan"))
+                q.append(1 if qv in ("1", "fix", "fixed") else 2 if qv in ("2", "float") else (int(qv) if qv.isdigit() else 0))
+            except (ValueError, IndexError):
+                continue
+        kind = "RTK"
+    if len(t) < 5:
+        raise ValueError("no RTK/PPK solutions found")
+    o = np.argsort(t)
+    return dict(t=np.asarray(t)[o], lat=np.asarray(la)[o], lon=np.asarray(lo)[o], h=np.asarray(h, float)[o],
+                q=np.asarray(q, int)[o], kind=kind)
+
+
+def apply_rtk_to_telemetry(tel, rtk):
+    """Aligns the RTK clock to the video clock by overlaying the tracks (whole-span search, refined to
+    20 ms) and replaces positions / heights. Returns (new Telemetry, summary)."""
+    t = tel.t
+    sel = np.linspace(0, len(t) - 1, min(len(t), 300)).astype(int)
+    bt, bla, blo = t[sel], tel.lat[sel], tel.lon[sel]
+    rt = rtk["t"]
+
+    def cost(tau):
+        tt = bt + tau
+        ok = (tt >= rt[0]) & (tt <= rt[-1])
+        if ok.sum() < 0.6 * len(tt):
+            return np.inf
+        e, n = latlon_to_en(np.interp(tt[ok], rt, rtk["lat"]), np.interp(tt[ok], rt, rtk["lon"]), bla[ok].mean(), blo[ok].mean())
+        e0, n0 = latlon_to_en(bla[ok], blo[ok], bla[ok].mean(), blo[ok].mean())
+        return float(np.median(np.hypot(e - e0, n - n0)))
+
+    cands = np.arange(rt[0] - bt[0], rt[-1] - bt[-1] + 0.5, 0.5)
+    if not len(cands):
+        raise ValueError("the RTK log is shorter than the video")
+    tau = float(cands[int(np.argmin([cost(c) for c in cands]))])
+    for step, span in ((0.25, 4.0), (0.02, 0.5)):
+        grid = np.arange(tau - span, tau + span + 1e-9, step)
+        tau = float(grid[int(np.argmin([cost(g) for g in grid]))])
+    med = cost(tau)
+    if not np.isfinite(med) or med > 12.0:
+        raise ValueError(f"RTK track does not match the video GPS track (best {med:.1f} m)")
+    h_ok = np.isfinite(rtk["h"]).any()
+    h0 = None
+    recs = []
+    fixes = []
+    for r in tel.recs:
+        n = dict(r)
+        tt = r["t"] + tau
+        if rt[0] <= tt <= rt[-1]:
+            n["lat"] = float(np.interp(tt, rt, rtk["lat"]))
+            n["lon"] = float(np.interp(tt, rt, rtk["lon"]))
+            if h_ok:
+                hh = float(np.interp(tt, rt, rtk["h"]))
+                h0 = hh if h0 is None else h0
+                n["abs_alt"], n["rel_alt"] = hh, hh - h0
+            fixes.append(int(rtk["q"][min(len(rt) - 1, int(np.searchsorted(rt, tt)))]))
+        recs.append(n)
+    meta = dict(tel.meta, latlon_order="rtk", latlon_ambiguous=False)
+    new = Telemetry(recs, tel.source + "+" + rtk["kind"], meta)
+    fx = np.asarray(fixes)
+    fix = float(np.mean(fx == 1)) if len(fx) else 0.0
+    flt = float(np.mean(fx == 2)) if len(fx) else 0.0
+    src = f"{rtk['kind']}_FIXED" if fix >= 0.9 else (f"{rtk['kind']}_FLOAT" if fix + flt >= 0.9 else "GNSS")
+    return new, dict(kind=rtk["kind"], position_source=src, epochs=int(len(rt)), matched_fixes=int(len(fx)),
+                     fix_pct=round(100 * fix, 1), float_pct=round(100 * flt, 1), clock_offset_s=round(tau, 3),
+                     track_match_median_m=round(med, 2))
+
+
+def read_intrinsics(path):
+    """OpenCV YAML/JSON, COLMAP cameras.txt or {fx, fy, cx, cy, k1, k2, p1, p2, width, height}."""
+    with open(path, "r", errors="replace") as fh:
+        text = fh.read()
+    K = None
+    m = re.search(r"^\s*\d+\s+(OPENCV|PINHOLE|SIMPLE_RADIAL|RADIAL|SIMPLE_PINHOLE)\s+(\d+)\s+(\d+)\s+([-\d.eE\s]+)$", text, re.M)
+    if m:
+        model, w, h, p = m.group(1), int(m.group(2)), int(m.group(3)), [float(v) for v in m.group(4).split()]
+        if model == "OPENCV":
+            K = dict(fx=p[0], fy=p[1], cx=p[2], cy=p[3], k1=p[4], k2=p[5], p1=p[6], p2=p[7])
+        elif model == "PINHOLE":
+            K = dict(fx=p[0], fy=p[1], cx=p[2], cy=p[3])
+        else:
+            K = dict(fx=p[0], fy=p[0], cx=p[1], cy=p[2], k1=p[3] if len(p) > 3 else 0.0, k2=p[4] if model == "RADIAL" and len(p) > 4 else 0.0)
+        K.update(width=w, height=h)
+    elif "camera_matrix" in text and "data" in text:
+        def arr(name):
+            mm = re.search(name + r"[\s\S]*?data\s*:\s*\[([^\]]*)\]", text)
+            return [float(v) for v in re.split(r"[,\s]+", mm.group(1).strip()) if v] if mm else None
+        C, D = arr("camera_matrix"), (arr("distortion_coefficients") or []) + [0.0] * 5
+        wm, hm = re.search(r"image_width\s*:\s*(\d+)", text), re.search(r"image_height\s*:\s*(\d+)", text)
+        K = dict(fx=C[0], fy=C[4], cx=C[2], cy=C[5], k1=D[0], k2=D[1], p1=D[2], p2=D[3],
+                 width=int(wm.group(1)) if wm else None, height=int(hm.group(1)) if hm else None)
+    else:
+        j = json.loads(text)
+        C = j.get("camera_matrix") or j.get("K")
+        if isinstance(C, dict):
+            C = C.get("data")
+        if C is not None:
+            C = np.asarray(C, float).ravel()
+            D = list(np.asarray(j.get("distortion_coefficients") or j.get("dist") or [], float).ravel()) + [0.0] * 5
+            K = dict(fx=C[0], fy=C[4], cx=C[2], cy=C[5], k1=D[0], k2=D[1], p1=D[2], p2=D[3])
+        else:
+            K = {k: float(j.get(k, 0.0)) for k in ("fx", "fy", "cx", "cy", "k1", "k2", "p1", "p2")}
+            K["fy"] = K["fy"] or K["fx"]
+        K.update(width=j.get("width") or j.get("image_width"), height=j.get("height") or j.get("image_height"))
+    for k in ("k1", "k2", "p1", "p2"):
+        K.setdefault(k, 0.0)
+    if not K.get("width"):
+        K["width"], K["height"] = int(round(2 * K["cx"])), int(round(2 * K["cy"]))
+    return K
+
+
+def intrinsics_params(K, w, h):
+    sx, sy = w / float(K["width"]), h / float(K["height"])
+    if abs(sx - sy) > 0.01 * max(sx, sy):
+        raise ValueError(f"calibration is {K['width']}x{K['height']} but keyframes are {w}x{h} (aspect differs)")
+    p = [K["fx"] * sx, K["fy"] * sy, K["cx"] * sx, K["cy"] * sy]
+    if any(abs(K[k]) > 0 for k in ("k1", "k2", "p1", "p2")):
+        return "OPENCV", ",".join(f"{v:.6f}" for v in p + [K["k1"], K["k2"], K["p1"], K["p2"]])
+    return "PINHOLE", ",".join(f"{v:.6f}" for v in p)
+
+
+# -----------------------------------------------------------------------------
 # worker processes (all pycolmap work happens in children)
 # -----------------------------------------------------------------------------
 class WorkerError(RuntimeError):
@@ -1356,11 +1703,14 @@ def worker_sfm(a):
     t = time.time()
     best, mapper = None, None
     try:
-        try:
-            ok = pycolmap.calibrate_view_graph(db, pycolmap.ViewGraphCalibrationOptions())
-            log(f"  view-graph focal calibration: {'ok' if ok else 'not converged'}")
-        except Exception as e:
-            log(f"  view-graph calibration skipped: {e}")
+        if a.get("fixed_intrinsics"):
+            log("  lab calibration supplied: view-graph focal calibration skipped, intrinsics fixed in BA")
+        else:
+            try:
+                ok = pycolmap.calibrate_view_graph(db, pycolmap.ViewGraphCalibrationOptions())
+                log(f"  view-graph focal calibration: {'ok' if ok else 'not converged'}")
+            except Exception as e:
+                log(f"  view-graph calibration skipped: {e}")
         go = pycolmap.GlobalPipelineOptions()
         _set(go, "random_seed", 0)
         _set(go, "num_threads", -1)
@@ -1374,6 +1724,14 @@ def worker_sfm(a):
             gm.bundle_adjustment.ceres.solver_options.max_num_iterations = int(a.get("ba_iters", 60))
         except Exception as e:
             log(f"  (BA iteration cap not applied: {e})")
+        if a.get("fixed_intrinsics"):
+            try:
+                bao = gm.bundle_adjustment
+                for k in ("refine_focal_length", "refine_principal_point", "refine_extra_params"):
+                    _set(bao, k, False)
+                gm.bundle_adjustment = bao
+            except Exception as e:
+                log(f"  (fixed intrinsics not applied to BA: {e})")
         go.mapper = gm
         gdir = ensure_dir(os.path.join(out_dir, "global"))
         recs = pycolmap.global_mapping(db, img_dir, gdir, go)
@@ -1397,6 +1755,9 @@ def worker_sfm(a):
         _set(io, "ba_local_max_num_iterations", 15)
         _set(io, "ba_global_frames_ratio", 1.4)
         _set(io, "ba_global_points_ratio", 1.4)
+        if a.get("fixed_intrinsics"):
+            for k in ("ba_refine_focal_length", "ba_refine_principal_point", "ba_refine_extra_params"):
+                _set(io, k, False)
         idir = ensure_dir(os.path.join(out_dir, "incremental"))
         try:
             recs = pycolmap.incremental_mapping(db, img_dir, idir, io)
@@ -1636,6 +1997,8 @@ def worker_fusion(a):
     _set(fo, "check_num_images", 50)
     _set(fo, "num_threads", -1)
     _set(fo, "use_cache", False)
+    if a.get("mask_path"):
+        _set(fo, "mask_path", a["mask_path"])      # sky + MOVING objects are not fused
     t = time.time()
     pycolmap.stereo_fusion(a["output_path"], dense, workspace_format="COLMAP", pmvs_option_name="option-all",
                            input_type=a["input_type"], options=fo, output_type="ply")
@@ -1670,7 +2033,45 @@ def worker_simplify(a):
     return dict(seconds=time.time() - t)
 
 
-WORKERS = dict(sfm=worker_sfm, mvs=worker_mvs, fusion=worker_fusion, poisson=worker_poisson, simplify=worker_simplify)
+def worker_detect(a):
+    """YOLO instance segmentation of the keyframes (own process: its GPU memory is freed afterwards)."""
+    try:
+        from ultralytics import YOLO
+    except Exception as e:
+        return dict(ok=False, reason=f"ultralytics not installed ({e})")
+    model, used = None, None
+    for w in YOLO_WEIGHTS:
+        try:
+            model, used = YOLO(w), w
+            break
+        except Exception as e:
+            log(f"  {w} unavailable: {e}")
+    if model is None:
+        return dict(ok=False, reason="no YOLO weights could be loaded")
+    t = time.time()
+    paths = [os.path.join(a["image_dir"], n) for n in a["names"]]
+    out = {}
+    classes = sorted(DYNAMIC_CLASSES)
+    for s in range(0, len(paths), 16):
+        chunk = paths[s:s + 16]
+        res = model.predict(chunk, imgsz=int(a.get("imgsz", 1280)), conf=float(a.get("conf", 0.25)), classes=classes,
+                            verbose=False, retina_masks=False, half=True)
+        for p, r in zip(chunk, res):
+            inst = []
+            if r.masks is not None and r.boxes is not None:
+                cls = r.boxes.cls.cpu().numpy().astype(int)
+                cf = r.boxes.conf.cpu().numpy()
+                for poly, c, f in zip(r.masks.xy, cls, cf):
+                    if poly is not None and len(poly) >= 3:
+                        inst.append(dict(cls=int(c), label=DYNAMIC_CLASSES.get(int(c), str(c)), conf=round(float(f), 3),
+                                         poly=np.asarray(poly, float).round(1).tolist()))
+            out[os.path.basename(p)] = inst
+    json_dump(out, a["out_path"])
+    return dict(ok=True, weights=used, seconds=time.time() - t, detections=int(sum(len(v) for v in out.values())))
+
+
+WORKERS = dict(sfm=worker_sfm, mvs=worker_mvs, fusion=worker_fusion, poisson=worker_poisson, simplify=worker_simplify,
+               detect=worker_detect)
 
 
 def _worker_entry(name, args_path):
@@ -2641,6 +3042,29 @@ def run(cfg: Config):
                 break
     tel = load_telemetry(srt, vinfo["duration"])
     report["video"] = vinfo
+    report["inputs"] = dict(telemetry=os.path.basename(srt) if srt else None, rtk=None,
+                            intrinsics=None, dynamic_masks=bool(cfg.dynamic_masks))
+    if cfg.quality == "sih" and cfg.target_minutes <= 0:
+        # problem statement: a 10-minute video in < 15 minutes -> budget 1.4 x the video length (6-14 min)
+        mins = float(np.clip(1.4 * vinfo["duration"] / 60.0, 6.0, 14.0))
+        budget.total = prof["target_s"] = 60.0 * mins
+        prof["max_kf"] = int(min(prof["max_kf"], 60 + 34 * vinfo["duration"] / 60.0))
+        log(f"SIH mode: budget {fmt_s(budget.total)} for {vinfo['duration'] / 60:.1f} min of video, "
+            f"<= {prof['max_kf']} keyframes")
+    if cfg.rtk_path:
+        try:
+            rtk = read_rtk(cfg.rtk_path)
+            try:
+                tel, rsum = apply_rtk_to_telemetry(tel, rtk)
+            except ValueError:
+                tel, rsum = apply_rtk_to_telemetry(tel.swapped(), rtk)     # GPS(lon, lat) log
+            report["inputs"]["rtk"] = rsum
+            log(f"RTK/PPK: {rsum['position_source']} ({rsum['fix_pct']} % fixed), clock offset "
+                f"{rsum['clock_offset_s']:.2f} s, tracks agree to {rsum['track_match_median_m']} m")
+        except Exception as e:
+            msg = f"RTK/PPK file not used: {e}"
+            warn(msg)
+            report["warnings"].append(msg)
     clock.stop(f"{vinfo['width']}x{vinfo['height']} {vinfo['codec']} {vinfo['fps']:.2f} fps, "
                f"{vinfo['duration'] / 60:.1f} min, {vinfo['size_mb']:.0f} MB")
 
@@ -2673,25 +3097,52 @@ def run(cfg: Config):
     kf_w, kf_h = ing["kf_size"]
     names = [k["filename"] for k in kfs]
     f_px, f35 = focal_prior(cfg, tel, kf_w)
+    cam_model, cam_params, fixed_K = cfg.camera_model, None, False
+    if cfg.intrinsics_path:
+        try:
+            Kc = read_intrinsics(cfg.intrinsics_path)
+            cam_model, cam_params = intrinsics_params(Kc, kf_w, kf_h)
+            fixed_K = True
+            report["inputs"]["intrinsics"] = dict(file=os.path.basename(cfg.intrinsics_path), model=cam_model)
+            log(f"camera calibration: {cam_model} {cam_params} (fixed in the bundle adjustment)")
+        except Exception as e:
+            msg = f"camera calibration not used: {e}"
+            warn(msg)
+            report["warnings"].append(msg)
     sfm_args = dict(database_path=os.path.join(dirs["sfm"], "database.db"), image_dir=dirs["images"],
-                    output_dir=dirs["sfm"], image_names=names, camera_model=cfg.camera_model,
-                    camera_params=camera_params_string(cfg.camera_model, f_px, kf_w, kf_h) if f_px else "",
+                    output_dir=dirs["sfm"], image_names=names, camera_model=cam_model,
+                    camera_params=cam_params or (camera_params_string(cam_model, f_px, kf_w, kf_h) if f_px else ""),
+                    fixed_intrinsics=fixed_K,
                     focal_factor=0.72, sift_max_size=max(kf_w, kf_h), sift_feats=prof["sift_feats"],
                     first_octave=0,
                     seq_overlap=prof["seq_overlap"], loop_imgs=prof["loop_imgs"],
                     keep_tracks=prof["keep_tracks"], ba_rounds=prof["ba_rounds"], ba_iters=prof["ba_iters"],
                     verbose=cfg.verbose)
     n = len(names)
-    # oblique video: keep sky / clouds out of feature matching
+    # sky (oblique video) and every vehicle / person / animal stay out of feature matching
+    instances = {}
+    mdir = os.path.join(dirs["work"], "masks")
+    if cfg.dynamic_masks:
+        try:
+            det = run_worker("detect", dict(image_dir=dirs["images"], names=names,
+                                            out_path=os.path.join(dirs["work"], "instances.json")),
+                             dirs, timeout=max(120.0, 0.08 * budget.total), verbose=cfg.verbose)
+            if det.get("ok"):
+                with open(os.path.join(dirs["work"], "instances.json")) as fh:
+                    instances = json.load(fh)
+                log(f"dynamic objects: {det['detections']} detections in {fmt_s(det['seconds'])} ({det['weights']})")
+            else:
+                log(f"dynamic-object detection skipped: {det.get('reason')}")
+        except Exception as e:
+            warn(f"dynamic-object detection skipped: {str(e).splitlines()[0][:200]}")
     try:
-        mdir = os.path.join(dirs["work"], "masks")
-        share = write_sky_masks(dirs["images"], names, mdir)
-        if share > 0.05:
+        ms = write_frame_masks(dirs["images"], names, mdir, instances)
+        if ms["sky_frames"] > 0.05 * n or ms["masked_instances"]:
             sfm_args["mask_path"] = mdir
-            log(f"sky masks: horizon visible in {100 * share:.0f}% of keyframes -> sky excluded from features")
-        report["sky_masked_share"] = round(share, 3)
+        log(f"feature masks: sky in {ms['sky_frames']}/{n} keyframes, {ms['masked_instances']} dynamic objects")
+        report["sky_masked_share"] = round(ms["sky_frames"] / max(1, n), 3)
     except Exception as e:
-        warn(f"sky masks skipped: {e}")
+        warn(f"feature masks skipped: {e}")
     est_pairs = n * (prof["seq_overlap"] + 4)
     if tel.has_gps and tel.gps_spread_m > 20:
         en_lat, en_lon = tk["lat"], tk["lon"]
@@ -2723,6 +3174,23 @@ def run(cfg: Config):
     report["sfm"] = {k: v for k, v in sfm.items() if k not in ("summary",)}
     clock.stop(f"{sfm['num_registered']}/{sfm['num_images']} registered, {sfm['num_points']} pts, "
                f"{sfm['mapper']} mapper, reproj {sfm.get('mean_reproj_error', float('nan')):.2f}px")
+
+    # moving objects: removed from depth fusion; parked ones stay (they are real obstacles)
+    fusion_masks = mdir if os.path.isdir(mdir) else None
+    if instances:
+        try:
+            t_m = time.time()
+            moving = motion_test(summ, dirs["images"], instances)
+            fdir = os.path.join(dirs["work"], "fusion_masks")
+            write_frame_masks(dirs["images"], summ.names, fdir, instances, moving)
+            fusion_masks = fdir
+            report["dynamic_objects"] = dynamic_summary(instances, moving)
+            d = report["dynamic_objects"]
+            log(f"motion test ({fmt_s(time.time() - t_m)}): {d['moving']} moving, {d['static']} static, "
+                f"{d['undecided']} undecided of {d['detections']} detections")
+        except Exception as e:
+            warn(f"motion test skipped: {e}")
+            report["dynamic_objects"] = dynamic_summary(instances)
 
     # ---- 3. dense MVS ----------------------------------------------------------
     clock.start("3. dense MVS (CUDA PatchMatch)")
@@ -2770,7 +3238,7 @@ def run(cfg: Config):
         fus = run_worker("fusion", dict(dense_dir=dirs["dense"], image_names=mvs["fusion_images"],
                                         input_type=mvs["input_type"], fusion_size=long_side,
                                         min_num_pixels=3 if n_f < 250 else 4, output_path=fused_path,
-                                        verbose=cfg.verbose), dirs, verbose=cfg.verbose)
+                                        mask_path=fusion_masks, verbose=cfg.verbose), dirs, verbose=cfg.verbose)
         dense_ok = os.path.exists(fused_path) and os.path.getsize(fused_path) > 10000
         clock.stop(f"{n_f} maps at {long_side}px, {fus['bytes'] / 27e6:.1f}M points")
     except Exception as e:
@@ -2846,6 +3314,11 @@ def run(cfg: Config):
     report["timings"] = [dict(stage=a, seconds=round(b, 1), note=c) for a, b, c in clock.rows]
     total = sum(r[1] for r in clock.rows)
     report["total_seconds"] = round(total, 1)
+    ratio = total / max(1.0, vinfo["duration"])
+    report["sih_time"] = dict(ratio=round(ratio, 2), minutes_per_10_min_video=round(10 * ratio, 1),
+                              target_met=bool(ratio <= 1.5))
+    log(f"processing / video time = {ratio:.2f} (problem-statement target <= 1.50: "
+        f"{'met' if ratio <= 1.5 else 'NOT met - use QUALITY=sih or a faster GPU'})")
     with zipfile.ZipFile(cfg.bundle_zip, "a") as z:
         z.writestr("recon_report.json", json.dumps(report, indent=1, default=_json_default))
     print(clock.table(budget.total), flush=True)
@@ -3141,6 +3614,17 @@ def _write_bundle(cfg, dirs, vinfo, tel, srt, kfs, summ, geo, mesh, points_ply, 
         e, n = latlon_to_en(tel.lat, tel.lon, float(np.mean(tel.lat)), float(np.mean(tel.lon)))
         telem["total_distance_meters"] = round(float(np.sum(np.hypot(np.diff(e), np.diff(n)))), 1)
         telem["altitude_reference"] = "relative" if tel.has_alt else "estimated"
+        rin = report.get("inputs") or {}
+        if rin.get("rtk"):
+            telem["position_source"] = rin["rtk"]["position_source"]
+            telem["rtk_summary"] = rin["rtk"]
+            for w, r in zip(telem["waypoints"], tel.g):
+                if r.get("abs_alt") is not None:
+                    w["absolute_altitude_m"] = round(float(r["abs_alt"]), 3)
+        if rin.get("intrinsics"):
+            telem["intrinsics_source"] = f"lab calibration {rin['intrinsics']['file']} ({rin['intrinsics']['model']}, fixed)"
+        if report.get("dynamic_objects"):
+            telem["dynamic_objects"] = report["dynamic_objects"]
     telem["metric_scale_factor"] = 1.0
     telem["georeference"] = dict(
         status="ok", version=3, source="prism_turbo", metric=True, mode=geo["method"], confidence=geo.get("confidence"),
@@ -3214,11 +3698,15 @@ def main(argv=None):
     ap.add_argument("--zip", default="/content/prism_colab_bundle.zip")
     ap.add_argument("--quality", default="balanced", choices=list(QUALITY))
     ap.add_argument("--minutes", type=float, default=0.0)
+    ap.add_argument("--rtk", default="", help="RTK / PPK positions (RTKLIB .pos or CSV)")
+    ap.add_argument("--intrinsics", default="", help="camera calibration (OpenCV YAML/JSON or COLMAP cameras.txt)")
+    ap.add_argument("--no-dynamic-masks", action="store_true")
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--verbose", action="store_true")
     ns = ap.parse_args(argv)
     cfg = Config(video_path=ns.video, srt_path=ns.srt, workdir=ns.workdir, bundle_zip=ns.zip, quality=ns.quality,
-                 target_minutes=ns.minutes, resume=ns.resume, verbose=ns.verbose)
+                 target_minutes=ns.minutes, rtk_path=ns.rtk, intrinsics_path=ns.intrinsics,
+                 dynamic_masks=not ns.no_dynamic_masks, resume=ns.resume, verbose=ns.verbose)
     run(cfg)
 
 

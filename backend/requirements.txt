@@ -1,0 +1,14 @@
+# PRISM backend (Python 3.10+). Install:  pip install -r backend/requirements.txt
+fastapi>=0.110
+uvicorn>=0.29
+python-multipart>=0.0.9      # file uploads (missions, RTK / calibration files)
+pydantic>=2.0
+numpy>=1.24
+scipy>=1.11
+opencv-python>=4.8
+open3d>=0.18                 # surface meshing (screened Poisson)
+
+# optional
+# ultralytics>=8.3           # YOLO-seg: remove moving vehicles / people / animals in the local pipeline
+# laspy, tifffile            # only used by the tests to read back LAS / GeoTIFF exports
+# COLMAP 4.x with CUDA       # local reconstruction (C:\COLMAP\bin\colmap.exe or on PATH)
