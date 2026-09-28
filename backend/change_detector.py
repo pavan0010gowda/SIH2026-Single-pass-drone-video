@@ -28,10 +28,20 @@ import sys
 import json
 import math
 import numpy as np
-from scipy.ndimage import label, binary_dilation
+from scipy.ndimage import label, binary_dilation, grey_opening, gaussian_filter, distance_transform_edt
 from scipy.signal import fftconvolve
 from scipy.spatial import cKDTree
-import open3d as o3d
+
+
+def _nan_fill(a):
+    a = np.asarray(a, np.float64)
+    bad = ~np.isfinite(a)
+    if not bad.any():
+        return a
+    if bad.all():
+        return np.zeros_like(a)
+    idx = distance_transform_edt(bad, return_distances=False, return_indices=True)
+    return a[tuple(idx)]
 
 _BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
 if _BACKEND_DIR not in sys.path:
@@ -346,28 +356,31 @@ class TemporalChangeDetector:
         nz = int(np.ceil((z_max - z_min) / RES))
 
         def make_dsm(pts):
-            ix = np.clip(np.floor((pts[:, 0] - x_min) / RES).astype(int), 0, nx - 1)
-            iz = np.clip(np.floor((pts[:, 2] - z_min) / RES).astype(int), 0, nz - 1)
+            """95th-percentile surface per cell (vectorised: one sort, no Python loop)."""
+            ix = np.clip(np.floor((pts[:, 0] - x_min) / RES).astype(np.int64), 0, nx - 1)
+            iz = np.clip(np.floor((pts[:, 2] - z_min) / RES).astype(np.int64), 0, nz - 1)
             flat = iz * nx + ix
-            order = np.argsort(flat)
-            flat_sorted = flat[order]
-            y_sorted = pts[order, 1]
+            order = np.lexsort((pts[:, 1], flat))
+            uk, st, cnt = np.unique(flat[order], return_index=True, return_counts=True)
+            good = cnt >= 2
+            dsm = np.full(nz * nx, np.nan, dtype=np.float32)
+            dsm[uk[good]] = pts[order, 1][st[good] + np.floor(0.95 * (cnt[good] - 1)).astype(np.int64)]
+            return dsm.reshape(nz, nx)
 
-            uniq, first_idx = np.unique(flat_sorted, return_index=True)
-            last_idx = np.append(first_idx[1:], len(flat_sorted))
-            dsm = np.full((nz, nx), np.nan, dtype=np.float32)
-            dsm_flat = dsm.ravel()
-            for u, f, l in zip(uniq, first_idx, last_idx):
-                if l - f >= 2:
-                    dsm_flat[u] = np.percentile(y_sorted[f:l], 95)
-            return dsm
+        def object_heights(dsm):
+            """Height above a quick bare-earth surface (morphological opening removes objects < 24 m)."""
+            filled = _nan_fill(dsm)
+            r = max(2, int(round(12.0 / RES)))
+            ground = grey_opening(filled, size=(2 * r + 1, 2 * r + 1))
+            ground = gaussian_filter(ground, 2.0 / RES)
+            return np.where(np.isfinite(dsm), dsm - ground, 0.0)
 
         dsm_b0 = make_dsm(base_aligned)
         dsm_r = make_dsm(recon_pts)
 
         # 5. Sub-pixel 2D Cross-Correlation on elevated relief to remove residual GNSS horizontal drift
-        feat_b_img = (dsm_b0 > 2.0).astype(float)
-        feat_r_img = (dsm_r > 2.0).astype(float)
+        feat_b_img = (object_heights(dsm_b0) > 2.0).astype(float)
+        feat_r_img = (object_heights(dsm_r) > 2.0).astype(float)
 
         shift_x, shift_z = 0.0, 0.0
         if feat_b_img.sum() >= 20 and feat_r_img.sum() >= 20:
@@ -418,7 +431,7 @@ class TemporalChangeDetector:
         pos_mask = valid & (diff >= eff_thresh)
 
         # Dilation mask of pre-existing baseline structures (eliminates wall-edge artifacts)
-        struct_b = binary_dilation(dsm_b > 2.0, iterations=2)
+        struct_b = binary_dilation(object_heights(dsm_b) > 2.0, iterations=2)
         pos_mask &= (~struct_b)
 
         # 8. Connected Component Analysis & Tactical Object Extraction
@@ -503,7 +516,7 @@ class TemporalChangeDetector:
         # 9. Removed Structures Tracking
         loss = dsm_b - dsm_r
         neg_mask = valid & (loss >= max(1.5, lod95))
-        struct_r = binary_dilation(dsm_r > 2.0, iterations=2)
+        struct_r = binary_dilation(object_heights(dsm_r) > 2.0, iterations=2)
         neg_mask &= (~struct_r)
 
         lbl_neg, n_neg = label(neg_mask, structure=structure_2d)

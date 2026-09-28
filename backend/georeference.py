@@ -276,10 +276,45 @@ def qvec_to_rotmat(q):
         [2 * x * z - 2 * w * y, 2 * y * z + 2 * w * x, 1 - 2 * x * x - 2 * y * y]])
 
 
-def _pose_record(qvec, tvec):
+def _pose_record(qvec, tvec, camera_id=None):
     r = qvec_to_rotmat(qvec)          # world -> camera
     t = np.asarray(tvec, dtype=float)
-    return {"R": r, "t": t, "C": -r.T @ t}
+    return {"R": r, "t": t, "C": -r.T @ t, "camera_id": camera_id}
+
+
+_CAM_MODELS = {0: ("SIMPLE_PINHOLE", 3), 1: ("PINHOLE", 4), 2: ("SIMPLE_RADIAL", 4), 3: ("RADIAL", 5),
+               4: ("OPENCV", 8), 5: ("OPENCV_FISHEYE", 8), 6: ("FULL_OPENCV", 12), 7: ("FOV", 5),
+               8: ("SIMPLE_RADIAL_FISHEYE", 4), 9: ("RADIAL_FISHEYE", 5), 10: ("THIN_PRISM_FISHEYE", 12)}
+
+
+def read_colmap_cameras(model_dir):
+    """dict camera_id -> {model, width, height, params, fy}  (cameras.bin or cameras.txt)."""
+    out = {}
+    bin_path, txt_path = os.path.join(model_dir, "cameras.bin"), os.path.join(model_dir, "cameras.txt")
+    try:
+        if os.path.exists(bin_path):
+            with open(bin_path, "rb") as f:
+                n = struct.unpack("<Q", f.read(8))[0]
+                for _ in range(n):
+                    cid, mid, w, h = struct.unpack("<iiQQ", f.read(24))
+                    name, npar = _CAM_MODELS.get(mid, ("UNKNOWN", 0))
+                    params = struct.unpack("<" + "d" * npar, f.read(8 * npar)) if npar else ()
+                    out[cid] = {"model": name, "width": w, "height": h, "params": list(params)}
+        elif os.path.exists(txt_path):
+            with open(txt_path, "r", encoding="utf-8", errors="ignore") as f:
+                for ln in f:
+                    if ln.startswith("#") or not ln.strip():
+                        continue
+                    p = ln.split()
+                    out[int(p[0])] = {"model": p[1], "width": int(p[2]), "height": int(p[3]),
+                                      "params": [float(v) for v in p[4:]]}
+    except Exception:
+        return {}
+    for c in out.values():
+        pr = c["params"]
+        two_focal = c["model"] in ("PINHOLE", "OPENCV", "OPENCV_FISHEYE", "FULL_OPENCV", "FOV", "THIN_PRISM_FISHEYE")
+        c["fy"] = float(pr[1] if two_focal and len(pr) > 1 else (pr[0] if pr else 0.0))
+    return out
 
 
 def _read_images_bin(path):
@@ -299,7 +334,7 @@ def _read_images_bin(path):
             q = np.array(props[1:5])
             if not np.isfinite(q).all() or abs(np.linalg.norm(q) - 1.0) > 0.05:
                 raise ValueError("Unexpected images.bin layout")
-            out[name.decode("utf-8", errors="ignore")] = _pose_record(q, props[5:8])
+            out[name.decode("utf-8", errors="ignore")] = _pose_record(q, props[5:8], int(props[8]))
     return out
 
 
@@ -315,7 +350,7 @@ def _read_images_txt(path):
                 q = [float(v) for v in parts[1:5]]
                 t = [float(v) for v in parts[5:8]]
                 name = " ".join(parts[9:])
-                out[name] = _pose_record(q, t)
+                out[name] = _pose_record(q, t, int(parts[8]))
                 i += 2          # skip the POINTS2D line
                 continue
             except ValueError:
@@ -573,10 +608,12 @@ def has_real_gps(telemetry):
     return not str(telemetry.get("source", "")).upper().startswith("SYNTHETIC")
 
 
-def _telemetry_arrays(telemetry):
+def _telemetry_arrays(telemetry, swap_latlon=False):
     wps = telemetry.get("waypoints") or []
     lat = np.array([_f(w.get("latitude")) for w in wps])
     lon = np.array([_f(w.get("longitude")) for w in wps])
+    if swap_latlon:
+        lat, lon = lon, lat
     alt_ref = str(telemetry.get("altitude_reference", "relative")).lower()
     key = "absolute_altitude_m" if alt_ref == "absolute" else "relative_altitude_m"
     alt = np.array([_f(w.get(key, w.get("relative_altitude_m"))) for w in wps])
@@ -622,13 +659,16 @@ def _trailing_int(name):
     return int(m[-1]) if m else None
 
 
-def associate_gps(names, telemetry, frame_info):
+def associate_gps(names, telemetry, frame_info, swap_latlon=False):
     """GPS/altitude at the capture instant of each registered image, as local ENU metres."""
     if not has_real_gps(telemetry):
         return None
-    arr = _telemetry_arrays(telemetry)
+    arr = _telemetry_arrays(telemetry, swap_latlon)
     if arr is None:
         return None
+    if isinstance(frame_info, list):          # pose-list format (bundle / post-georeference frame_index.json)
+        frame_info = {"frames": {f.get("filename"): {"time_s": f.get("timestamp_sec")}
+                                 for f in frame_info if isinstance(f, dict) and f.get("filename")}}
     frames = (frame_info or {}).get("frames") or {}
     tq = np.array([_f((frames.get(n) or {}).get("time_s")) for n in names])
     latlon = np.c_[arr["lat"], arr["lon"]]
@@ -656,6 +696,116 @@ def associate_gps(names, telemetry, frame_info):
     enu = geodetic_to_enu(ll[:, 0], ll[:, 1], alt, origin)
     return {"enu": enu, "valid": valid & np.isfinite(enu).all(1), "origin": origin,
             "sync": sync, "alt_ref": arr["alt_ref"], "alt": alt}
+
+
+def _alt_is_agl_like(gps):
+    """True when the logged altitude can stand in for height above the take-off ground."""
+    if gps is None:
+        return False
+    if gps["alt_ref"] == "relative":
+        return True
+    if gps["alt_ref"] == "gps_altitude":
+        med = float(np.nanmedian(gps["alt"])) if len(gps["alt"]) else np.nan
+        return bool(np.isfinite(med) and 2.0 < med < 500.0)
+    return False
+
+
+def _quick_sim3_rmse(c_src, gps, rng):
+    """RMSE (m) of a robust similarity camera centres -> GPS ENU, and the implied up vector."""
+    m = gps["valid"]
+    if m.sum() < 5:
+        return np.inf, None
+    s, r, t, inl, rmse = ransac_similarity(c_src[m], gps["enu"][m], rng, iters=300)
+    if not (np.isfinite(s) and s > 0):
+        return np.inf, None
+    res = np.linalg.norm(gps["enu"][m] - (s * c_src[m] @ r.T + t), axis=1)
+    return float(np.sqrt(np.mean(res ** 2))), r.T @ np.array([0.0, 0.0, 1.0])
+
+
+def resolve_latlon_order(names, cam_centres, telemetry, frame_info, rng, diag=None):
+    """
+    Decides the latitude/longitude order of an ambiguous flight log with the camera trajectory.
+
+    Exchanging latitude and longitude mirrors the GPS track (and stretches it by cos(lat)), so only
+    the true order can be matched by a proper similarity transform. Both orders are fitted and the
+    one with the lower residual wins; a clear winner needs <= 60 % of the other RMSE.
+    Returns (gps association for the chosen order, swapped?).
+    """
+    gps = associate_gps(names, telemetry, frame_info)
+    if gps is None or not (telemetry or {}).get("latlon_ambiguous"):
+        return gps, False, True
+    alt = associate_gps(names, telemetry, frame_info, swap_latlon=True)
+    if alt is None:
+        return gps, False, False
+    r0, _ = _quick_sim3_rmse(cam_centres, gps, rng)
+    r1, _ = _quick_sim3_rmse(cam_centres, alt, rng)
+    if diag is not None:
+        diag["latlon_test_rmse_m"] = {"as_logged": round(r0, 3) if np.isfinite(r0) else None,
+                                      "swapped": round(r1, 3) if np.isfinite(r1) else None}
+    if np.isfinite(r1) and r1 < 0.6 * r0:
+        if diag is not None:
+            diag["latlon_order_resolved"] = "swapped"
+        return alt, True, True
+    decided = bool(np.isfinite(r0) and r0 < 0.6 * r1)
+    if diag is not None:
+        diag["latlon_order_resolved"] = "as_logged" if decided else "undecided"
+    return gps, False, decided
+
+
+def levelled_gps_fit(cam, gps, r_lvl):
+    """
+    4-DOF similarity (scale, heading, translation) between gravity-levelled camera centres and GPS ENU,
+    with iterative outlier rejection. Robust for straight flights and immune to the mirrored solutions a
+    free 3-D fit can produce on nearly planar / linear tracks. Returns (s, R, t, inliers, rmse_h).
+    """
+    m = gps["valid"]
+    p = cam[m] @ r_lvl.T
+    e = gps["enu"][m]
+    inl = np.ones(len(p), bool)
+    for _ in range(8):
+        s, r2, t2 = umeyama_2d(p[inl, :2], e[inl, :2])
+        res = np.linalg.norm(e[:, :2] - (s * p[:, :2] @ r2.T + t2), axis=1)
+        new = res < max(2.5 * GPS_NOISE_FLOOR_M, 3.0 * float(np.median(res[inl])))
+        if new.sum() < 4 or np.array_equal(new, inl):
+            break
+        inl = new
+    tz = float(np.median(e[inl, 2] - s * p[inl, 2]))
+    r3 = np.eye(3)
+    r3[:2, :2] = r2
+    full_inl = np.zeros(len(m), bool)
+    full_inl[np.flatnonzero(m)[inl]] = True
+    return s, r3 @ r_lvl, np.array([t2[0], t2[1], tz]), full_inl, float(np.sqrt(np.mean(res[inl] ** 2)))
+
+
+def umeyama_2d(src, dst):
+    ms, md = src.mean(0), dst.mean(0)
+    a, b = src - ms, dst - md
+    u, sv, vt = np.linalg.svd(b.T @ a / len(src))
+    sgn = np.eye(2)
+    if np.linalg.det(u) * np.linalg.det(vt) < 0:
+        sgn[1, 1] = -1
+    r = u @ sgn @ vt
+    var = (a ** 2).sum() / len(src)
+    s = float((sv * np.diag(sgn)).sum() / var) if var > 0 else 1.0
+    return s, r, md - s * r @ ms
+
+
+def estimate_ground_height(h):
+    """Lowest strong mode of the height histogram: a robust 'ground level' for nadir AND oblique views."""
+    h = np.asarray(h, float)
+    h = h[np.isfinite(h)]
+    if len(h) < 20:
+        return float(np.percentile(h, 5)) if len(h) else 0.0
+    lo, hi = np.percentile(h, [0.5, 75])
+    if hi - lo < 1e-9:
+        return float(lo)
+    hist, edges = np.histogram(h[(h >= lo) & (h <= hi)], bins=240, range=(lo, hi))
+    k = np.exp(-0.5 * (np.arange(-6, 7) / 2.0) ** 2)
+    sm = np.convolve(hist.astype(float), k / k.sum(), mode="same")
+    i = int(np.argmax(sm >= 0.3 * sm.max()))
+    while i + 1 < len(sm) and sm[i + 1] >= sm[i]:
+        i += 1
+    return float(0.5 * (edges[i] + edges[i + 1]))
 
 
 # =============================================================================
@@ -686,7 +836,10 @@ def georeference_reconstruction(model_dir, raw_points, telemetry=None, frame_inf
     diag.update(registered_cameras=len(names), view_distance_units=round(view_dist, 5))
 
     # ---------------- GPS similarity (scale + rotation + translation) ----------------
-    gps = associate_gps(names, telemetry, frame_info)
+    gps, swap, order_decided = resolve_latlon_order(names, cc, telemetry, frame_info, rng, diag)
+    if swap:
+        warnings.append("Flight log writes GPS(lon, lat): latitude/longitude order corrected using the "
+                        "camera trajectory.")
     fit = None
     if gps is not None:
         m = gps["valid"]
@@ -769,20 +922,35 @@ def georeference_reconstruction(model_dir, raw_points, telemetry=None, frame_inf
     ez = np.array([0.0, 0.0, 1.0])
     origin, heading_known, scale_rel_unc = None, False, None
     if fit is not None:
-        r_final = rotation_between(fit["R"] @ up, ez) @ fit["R"]
-        pg, cg = fit["pg"][fit["inl"]], fit["cg"][fit["inl"]]
-        inl = np.ones(len(pg), bool)
-        for _ in range(4):
-            xr = cg[inl] @ r_final.T
-            xc, pc = xr - xr.mean(0), pg[inl] - pg[inl].mean(0)
-            s = float((xc * pc).sum() / (xc ** 2).sum())
-            t = pg[inl].mean(0) - s * xr.mean(0)
-            res = np.linalg.norm(pg - (s * cg @ r_final.T + t), axis=1)
-            new = res < max(2.5 * GPS_NOISE_FLOOR_M, 3.0 * float(np.median(res)))
-            if new.sum() < 3 or np.array_equal(new, inl):
-                break
-            inl = new
-        rmse = float(np.sqrt(np.mean(res[inl] ** 2)))
+        # gravity is fixed by `up`; scale, heading and offset come from a levelled 4-DOF fit (robust for
+        # straight flights, and it cannot inherit a mirrored heading from the free 3-D fit)
+        r_lvl = rotation_between(up, ez)
+        s, r_final, t, inl_all, rmse = levelled_gps_fit(cc, gps, r_lvl)
+        alt_order = associate_gps(names, telemetry, frame_info, swap_latlon=not swap) \
+            if (telemetry or {}).get("latlon_ambiguous") and not order_decided else None
+        if alt_order is not None and _alt_is_agl_like(gps):
+            # straight flight: geometry cannot tell the lat/lon order, but swapping them rescales east-west
+            # distances by cos(latitude); only the true order makes GPS scale agree with the altitude scale
+            agl_u = camera_heights_above_ground(pts @ r_lvl.T, cc @ r_lvl.T)
+            if agl_u is not None:
+                okm = gps["valid"] & np.isfinite(agl_u) & (agl_u > 0) & (gps["alt"] > 5.0)
+                if okm.sum() >= 3:
+                    s_alt = float(np.median(gps["alt"][okm] / agl_u[okm]))
+                    s2, r2_, t2_, inl2, rmse2 = levelled_gps_fit(cc, alt_order, r_lvl)
+                    d1, d2 = abs(math.log(s / s_alt)), abs(math.log(s2 / s_alt))
+                    diag["latlon_altitude_test"] = {"scale_as_used": round(s, 5), "scale_swapped": round(s2, 5),
+                                                    "scale_from_altitude": round(s_alt, 5)}
+                    if d2 < 0.5 * d1 and d2 < math.log(1.25):
+                        gps, swap = alt_order, not swap
+                        s, r_final, t, inl_all, rmse = s2, r2_, t2_, inl2, rmse2
+                        diag["latlon_order_resolved"] = "swapped (altitude test)"
+                        warnings.append("Latitude/longitude order decided from the altitude-based scale "
+                                        "(straight flight path).")
+                    elif d1 < 0.5 * d2 and d1 < math.log(1.25):
+                        diag["latlon_order_resolved"] = "as_logged (altitude test)"
+        pg, cg = gps["enu"][gps["valid"]], cc[gps["valid"]]
+        inl = inl_all[gps["valid"]]
+        res = np.linalg.norm(pg - (s * cg @ r_final.T + t), axis=1)
         spread_tot = float(np.sqrt((fit["spread"] ** 2).sum()))
         scale_rel_unc = rmse / (spread_tot * math.sqrt(fit["n_eff"]))
         i, j = rng.integers(0, len(pg), (2, 4000))
@@ -794,7 +962,7 @@ def georeference_reconstruction(model_dir, raw_points, telemetry=None, frame_inf
             diag["scale_pairwise_crosscheck"] = round(s_pair, 6)
             if abs(s_pair / s - 1.0) > 0.05:
                 warnings.append(f"Scale cross-check differs by {100 * abs(s_pair / s - 1):.1f}%.")
-        if gps["alt_ref"] == "relative":
+        if _alt_is_agl_like(gps):
             agl_u = camera_heights_above_ground(pts @ r_final.T, cc @ r_final.T)
             if agl_u is not None:
                 ok = gps["valid"] & np.isfinite(agl_u) & (gps["alt"] > 5.0) & (agl_u > 0)
@@ -822,7 +990,7 @@ def georeference_reconstruction(model_dir, raw_points, telemetry=None, frame_inf
         if agl_u is None or not np.isfinite(agl_u).any():
             return {"status": "failed", "reason": "Cannot find the ground below the cameras.", "diagnostics": diag}
         alt_m = None
-        if gps is not None and gps["alt_ref"] == "relative":
+        if gps is not None and _alt_is_agl_like(gps):
             ok = gps["valid"] & np.isfinite(agl_u) & (gps["alt"] > 2.0) & (agl_u > 0)
             if ok.sum() >= 3:
                 s = float(np.median(gps["alt"][ok] / agl_u[ok]))
@@ -846,13 +1014,14 @@ def georeference_reconstruction(model_dir, raw_points, telemetry=None, frame_inf
     pm = s * pts @ r_final.T + t
     cm = s * cc @ r_final.T + t
     agl_m = camera_heights_above_ground(pm, cm)
-    ground = float(np.nanmedian(cm[:, 2] - agl_m)) if agl_m is not None else float(np.percentile(pm[:, 2], 20))
+    ground = estimate_ground_height(pm[:, 2])
     t = t - np.array([0.0, 0.0, ground])
     if origin is not None:
         la, lo, h = enu_to_geodetic(np.array([0.0, 0.0, ground]), origin)
         origin = (float(la), float(lo), float(h))
     if agl_m is not None:
         diag["median_camera_height_above_ground_m"] = round(float(np.nanmedian(agl_m)), 2)
+    diag["median_camera_height_above_datum_m"] = round(float(np.median(cm[:, 2] - ground)), 2)
 
     t4 = np.eye(4)
     t4[:3, :3] = YUP_FROM_ENU @ (s * r_final)
@@ -860,8 +1029,8 @@ def georeference_reconstruction(model_dir, raw_points, telemetry=None, frame_inf
     log(f"[Georef] mode={mode} confidence={confidence} scale={s:.6f} m/unit "
         f"(+/-{100 * (scale_rel_unc or 0):.2f}%)")
     return {
-        "status": "ok", "version": 2, "mode": mode, "confidence": confidence, "metric": True,
-        "heading_known": heading_known,
+        "status": "ok", "version": 3, "mode": mode, "confidence": confidence, "metric": True,
+        "heading_known": heading_known, "latlon_swapped": bool(swap),
         "origin": {"lat": origin[0], "lon": origin[1], "alt": origin[2]} if origin else None,
         "scale_m_per_unit": s,
         "scale_rel_uncertainty": float(scale_rel_unc) if scale_rel_unc is not None else None,
@@ -873,6 +1042,58 @@ def georeference_reconstruction(model_dir, raw_points, telemetry=None, frame_inf
 
 def georef_transform(georef):
     return np.asarray(georef["transform_raw_to_metric_yup"], dtype=float)
+
+
+def _rotmat_to_quat_xyzw(r):
+    r = np.asarray(r, float)
+    tr = np.trace(r)
+    if tr > 0:
+        s = math.sqrt(tr + 1.0) * 2
+        w, x, y, z = 0.25 * s, (r[2, 1] - r[1, 2]) / s, (r[0, 2] - r[2, 0]) / s, (r[1, 0] - r[0, 1]) / s
+    elif r[0, 0] > r[1, 1] and r[0, 0] > r[2, 2]:
+        s = math.sqrt(1.0 + r[0, 0] - r[1, 1] - r[2, 2]) * 2
+        w, x, y, z = (r[2, 1] - r[1, 2]) / s, 0.25 * s, (r[0, 1] + r[1, 0]) / s, (r[0, 2] + r[2, 0]) / s
+    elif r[1, 1] > r[2, 2]:
+        s = math.sqrt(1.0 + r[1, 1] - r[0, 0] - r[2, 2]) * 2
+        w, x, y, z = (r[0, 2] - r[2, 0]) / s, (r[0, 1] + r[1, 0]) / s, 0.25 * s, (r[1, 2] + r[2, 1]) / s
+    else:
+        s = math.sqrt(1.0 + r[2, 2] - r[0, 0] - r[1, 1]) * 2
+        w, x, y, z = (r[1, 0] - r[0, 1]) / s, (r[0, 2] + r[2, 0]) / s, (r[1, 2] + r[2, 1]) / s, 0.25 * s
+    q = np.array([x, y, z, w])
+    return q / np.linalg.norm(q)
+
+
+def metric_camera_frames(model_dir, t4, frame_info=None):
+    """
+    Registered keyframes in the metric Y-up frame, in the bundle's frame_index format:
+    [{index, filename, timestamp_sec, registered, position, quaternion_xyzw, fov_y_deg}, ...]
+    (three.js camera convention: looks down its local -Z, +Y up).
+    """
+    cams = read_colmap_images(model_dir)
+    intr = read_colmap_cameras(model_dir)
+    frames = ((frame_info or {}).get("frames") or {}) if isinstance(frame_info, dict) else {}
+    t4 = np.asarray(t4, float)
+    s = np.cbrt(np.linalg.det(t4[:3, :3]))
+    rs = t4[:3, :3] / s
+    flip = np.diag([1.0, -1.0, -1.0])
+    out = []
+    for k, name in enumerate(sorted(cams, key=natural_key)):
+        c = cams[name]
+        pos = t4[:3, :3] @ c["C"] + t4[:3, 3]
+        r3 = rs @ c["R"].T @ flip
+        e = {"index": k, "filename": name, "registered": True,
+             "position": [round(float(v), 4) for v in pos],
+             "quaternion_xyzw": [round(float(v), 6) for v in _rotmat_to_quat_xyzw(r3)]}
+        ci = intr.get(c.get("camera_id"))
+        if ci and ci.get("fy"):
+            e["fov_y_deg"] = round(float(2 * math.degrees(math.atan(ci["height"] / (2 * ci["fy"])))), 3)
+        fr = frames.get(name) or {}
+        if fr.get("time_s") is not None:
+            e["timestamp_sec"] = float(fr["time_s"])
+        if fr.get("source_frame") is not None:
+            e["frame_number"] = int(fr["source_frame"])
+        out.append(e)
+    return out
 
 
 def export_georeferenced_cloud(raw_ply, georef, out_paths):
