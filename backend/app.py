@@ -1,966 +1,1127 @@
-import os
-import sys
-import json
-import shutil
-import time
-import tempfile
-import zipfile
-from typing import Optional
+"""
+PRISM // API server (app.py)
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+Serves the dashboard (frontend/), the data folder, and the analysis API:
+  model & calibration   /api/model/info, /api/model/recalibrate, /api/model/meshify(+/status), downloads
+  terrain & measurement /api/terrain/*, /api/measure/height, /api/measure/between, /api/analysis/hag
+  roads & potholes      /api/road/audit, /api/road/audit/compile
+  planning              /api/analysis/sites, /api/analysis/route, /api/analysis/observers
+  change detection      /api/baseline/*, /api/baselines, /api/diff/*
+  buildings & exports   /api/analysis/buildings, /api/export/catalog, /api/export/file/{product}
+  quality & accuracy    /api/quality/report(.html), /api/quality/checkpoints
+  missions              /api/pipeline/start|status|cancel|import-colab, /api/cameras, /api/telemetry
+"""
+import base64
+import json
+import math
+import os
+import shutil
+import sys
+import tempfile
+import threading
+import time
+import zipfile
+from typing import List, Optional
+
+import numpy as np
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import JSONResponse, FileResponse
+from pydantic import BaseModel
 
 BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(BACKEND_DIR)
 if BACKEND_DIR not in sys.path:
     sys.path.insert(0, BACKEND_DIR)
 
-try:
-    from pipeline_manager import pipeline_mgr
-except ImportError:
-    from backend.pipeline_manager import pipeline_mgr
+from pipeline_manager import pipeline_mgr, generate_blender_surface_mesh  # noqa: E402
+from change_detector import change_detector, extract_telemetry_bounds    # noqa: E402
+from georeference import load_point_cloud                                 # noqa: E402
+import terrain as T                                                        # noqa: E402
+import height_engine as HE                                                 # noqa: E402
+import road_engine as RE                                                   # noqa: E402
+import tactical as TA                                                      # noqa: E402
+import recalibrate as RC                                                   # noqa: E402
+import plyio                                                               # noqa: E402
+import buildings as BL                                                     # noqa: E402
+import exports as EX                                                       # noqa: E402
 
-app = FastAPI(title="PRISM Command Center API & Tactical Dashboard")
+app = FastAPI(title="PRISM API")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
-# Enable CORS for cross-origin local access if needed
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
-# Dynamically resolve absolute project paths
-BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.dirname(BACKEND_DIR)
+@app.middleware("http")
+async def revalidate_dashboard(request, call_next):
+    """The dashboard's ES modules must never be served stale after an update (ETag keeps it cheap)."""
+    response = await call_next(request)
+    p = request.url.path
+    if p == "/" or p.startswith(("/js/", "/css/", "/data/")):
+        response.headers["Cache-Control"] = "no-cache"
+    return response
+
 DATA_DIR = os.path.join(PROJECT_ROOT, "data")
 FRONTEND_DIR = os.path.join(PROJECT_ROOT, "frontend")
 UPLOADS_DIR = os.path.join(DATA_DIR, "uploads")
+MODELS_DIR = os.path.join(DATA_DIR, "models")
+BASELINES_DIR = os.path.join(DATA_DIR, "baselines")
+for _d in (UPLOADS_DIR, MODELS_DIR, BASELINES_DIR):
+    os.makedirs(_d, exist_ok=True)
 
-os.makedirs(UPLOADS_DIR, exist_ok=True)
-
-# Mount static asset folders
 app.mount("/data", StaticFiles(directory=DATA_DIR), name="data")
-if os.path.exists(os.path.join(FRONTEND_DIR, "css")):
-    app.mount("/css", StaticFiles(directory=os.path.join(FRONTEND_DIR, "css")), name="css")
-if os.path.exists(os.path.join(FRONTEND_DIR, "js")):
-    app.mount("/js", StaticFiles(directory=os.path.join(FRONTEND_DIR, "js")), name="js")
+for _sub in ("css", "js", "assets"):
+    if os.path.exists(os.path.join(FRONTEND_DIR, _sub)):
+        app.mount(f"/{_sub}", StaticFiles(directory=os.path.join(FRONTEND_DIR, _sub)), name=_sub)
 
-# Serve dashboard root directly at "/"
+
+# =============================================================================
+# helpers
+# =============================================================================
+def clean(o):
+    """numpy-safe JSON conversion (NaN/inf -> None)."""
+    if isinstance(o, dict):
+        return {str(k): clean(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple)):
+        return [clean(v) for v in o]
+    if isinstance(o, np.ndarray):
+        return clean(o.tolist())
+    if isinstance(o, (np.floating, float)):
+        f = float(o)
+        return f if math.isfinite(f) else None
+    if isinstance(o, np.integer):
+        return int(o)
+    if isinstance(o, np.bool_):
+        return bool(o)
+    return o
+
+
+def jr(obj, status_code=200):
+    return JSONResponse(content=clean(obj), status_code=status_code)
+
+
+def _read_json(path, default=None):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+_terrain_lock = threading.Lock()
+
+
+def terrain_for(baseline_id=None):
+    with _terrain_lock:
+        try:
+            return T.get_terrain(DATA_DIR, baseline_id=baseline_id, log=pipeline_mgr.add_log)
+        except FileNotFoundError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+
+
+def _calibration(telem):
+    geo = (telem or {}).get("georeference") or {}
+    if not geo:
+        return None
+    return {"status": geo.get("status"), "metric": bool(geo.get("metric")), "mode": geo.get("mode"),
+            "confidence": geo.get("confidence"), "scale_rel_uncertainty": geo.get("scale_rel_uncertainty"),
+            "display_frame": geo.get("display_frame"), "units": "m" if geo.get("metric") else "model units",
+            "origin": geo.get("origin"), "source": geo.get("source"), "latlon_swapped": geo.get("latlon_swapped"),
+            "latlon_verified": (telem or {}).get("latlon_verified"), "warnings": geo.get("warnings", []),
+            "reason": geo.get("reason"), "diagnostics": geo.get("diagnostics")}
+
+
+def _read_calibration(telemetry_path):
+    return _calibration(_read_json(telemetry_path, {}))
+
+
+# =============================================================================
+# dashboard, telemetry, cameras
+# =============================================================================
 @app.get("/")
 def serve_dashboard():
     index_file = os.path.join(FRONTEND_DIR, "index.html")
     if os.path.exists(index_file):
-        return FileResponse(index_file)
-    return {"status": "PRISM Command Center API is actively running."}
+        return FileResponse(index_file, headers={"Cache-Control": "no-cache"})
+    return {"status": "PRISM API is running."}
+
 
 @app.get("/api/telemetry")
 def get_telemetry():
-    """
-    Feeds GPS and altitude data directly to the dashboard HUD.
-    """
-    telemetry_path = os.path.join(DATA_DIR, "flight_telemetry.json")
-    if os.path.exists(telemetry_path):
-        try:
-            with open(telemetry_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            return JSONResponse(content=data)
-        except Exception as e:
-            return JSONResponse(content={"error": f"Failed reading telemetry: {str(e)}"}, status_code=500)
-    else:
-        return JSONResponse(
-            content={"error": "Telemetry not found. Run telemetry parser or upload mission data first."}, 
-            status_code=404
-        )
+    path = os.path.join(DATA_DIR, "flight_telemetry.json")
+    data = _read_json(path)
+    if data is None:
+        return jr({"error": "No telemetry yet. Ingest a mission first.", "waypoints": []}, 404)
+    return jr(data)
 
-@app.get("/api/targets")
-def get_tactical_targets():
-    """
-    Returns AI-detected scene objects mapped to spatial coordinates within the 3D model.
-    """
-    targets = [
-        {
-            "id": "TGT-01",
-            "type": "VEHICLE",
-            "threat_level": "LOW",
-            "label": "Civilian Sedan (Grey)",
-            "position": [-0.65, -0.45, 0.85],
-            "dimensions": [1.8, 1.4, 4.2]
-        },
-        {
-            "id": "TGT-02",
-            "type": "VEHICLE",
-            "threat_level": "ELEVATED",
-            "label": "Black SUV (Static)",
-            "position": [-0.60, -0.45, -0.40],
-            "dimensions": [2.0, 1.7, 4.8]
-        },
-        {
-            "id": "TGT-03",
-            "type": "VANTAGE_POINT",
-            "threat_level": "HIGH",
-            "label": "Rooftop Overlook (East)",
-            "position": [1.45, 0.90, -0.30],
-            "dimensions": [3.5, 1.2, 3.5]
-        }
-    ]
-    return JSONResponse(content={"target_count": len(targets), "targets": targets})
 
-def _read_calibration(telemetry_path):
-    """Summary of the metric georeferencing record stored in a telemetry JSON (None if absent)."""
-    try:
-        with open(telemetry_path, "r", encoding="utf-8") as f:
-            geo = json.load(f).get("georeference") or {}
-    except Exception:
-        return None
-    if not geo:
-        return None
-    return {
-        "status": geo.get("status"),
-        "metric": bool(geo.get("metric")),
-        "mode": geo.get("mode"),
-        "confidence": geo.get("confidence"),
-        "scale_rel_uncertainty": geo.get("scale_rel_uncertainty"),
-        "display_frame": geo.get("display_frame"),
-        "units": "m" if geo.get("metric") else "model units",
-        "warnings": geo.get("warnings", []),
-        "reason": geo.get("reason"),
-    }
+@app.get("/api/cameras")
+def get_cameras():
+    """Keyframe camera poses in the model frame (for the video / 3-D overlay)."""
+    fi = _read_json(os.path.join(DATA_DIR, "workspace", "frame_index.json"))
+    frames = fi if isinstance(fi, list) else []
+    frames = [{"t": f.get("timestamp_sec"), "position": f.get("position"), "q": f.get("quaternion_xyzw"),
+               "fov_y": f.get("fov_y_deg"), "name": f.get("filename")}
+              for f in frames if f.get("position") and f.get("quaternion_xyzw") and f.get("timestamp_sec") is not None]
+    telem = _read_json(os.path.join(DATA_DIR, "flight_telemetry.json"), {})
+    return jr({"count": len(frames), "frames": frames, "video": telem.get("video")})
 
+
+# =============================================================================
+# model info, recalibration, meshing, downloads
+# =============================================================================
 @app.get("/api/model/info")
 def get_model_info():
-    """
-    Returns current active 3D model status, polygon mesh metadata, and file details.
-    """
-    model_path = os.path.join(DATA_DIR, "models", "actionable_threat_map.ply")
-    obj_path = os.path.join(DATA_DIR, "models", "actionable_threat_mesh.obj")
-    if os.path.exists(model_path):
-        size_bytes = os.path.getsize(model_path)
-        mtime = os.path.getmtime(model_path)
-        vertex_count = 0
-        face_count = 0
-        is_mesh = False
-        try:
-            with open(model_path, "rb") as f:
-                for _ in range(40):
-                    line = f.readline().decode("ascii", errors="ignore").strip()
-                    if line.startswith("element vertex"):
-                        vertex_count = int(line.split()[-1])
-                    elif line.startswith("element face"):
-                        face_count = int(line.split()[-1])
-                        if face_count > 0:
-                            is_mesh = True
-                    elif line == "end_header":
-                        break
-        except Exception:
-            pass
+    pts = os.path.join(MODELS_DIR, "actionable_threat_map_points.ply")
+    if not os.path.exists(pts):
+        pts = os.path.join(MODELS_DIR, "actionable_threat_map.ply")
+    if not os.path.exists(pts):
+        return {"exists": False}
+    v, _ = plyio.ply_counts(pts)
+    mesh = os.path.join(MODELS_DIR, "actionable_threat_mesh.ply")
+    mv, mf = plyio.ply_counts(mesh) if os.path.exists(mesh) else (0, 0)
+    telem = _read_json(os.path.join(DATA_DIR, "flight_telemetry.json"), {})
+    report = _read_json(os.path.join(DATA_DIR, "recon_report.json"), {}) or {}
+    return clean({
+        "exists": True, "points_file": os.path.relpath(pts, PROJECT_ROOT).replace("\\", "/"),
+        "vertex_count": v, "size_mb": round(os.path.getsize(pts) / 1e6, 1), "last_modified": os.path.getmtime(pts),
+        "has_mesh": os.path.exists(mesh), "mesh_vertices": mv, "mesh_faces": mf,
+        "mesh_last_modified": os.path.getmtime(mesh) if os.path.exists(mesh) else None,
+        "has_obj": os.path.exists(os.path.join(MODELS_DIR, "actionable_threat_mesh.obj")),
+        "has_glb": os.path.exists(os.path.join(MODELS_DIR, "actionable_threat_mesh.glb")),
+        "has_cameras": isinstance(_read_json(os.path.join(DATA_DIR, "workspace", "frame_index.json")), list),
+        "calibration": _calibration(telem), "telemetry_source": telem.get("source"),
+        "center_latitude": telem.get("center_latitude"), "center_longitude": telem.get("center_longitude"),
+        "recon": {k: report.get(k) for k in ("engine", "total_seconds") if report}, "sfm": report.get("sfm"),
+    })
 
-        return {
-            "exists": True,
-            "filename": "actionable_threat_map.ply",
-            "size_bytes": size_bytes,
-            "size_mb": round(size_bytes / (1024 * 1024), 2),
-            "last_modified": mtime,
-            "vertex_count": vertex_count,
-            "face_count": face_count,
-            "is_mesh": is_mesh,
-            "has_obj": os.path.exists(obj_path),
-            "obj_size_bytes": os.path.getsize(obj_path) if os.path.exists(obj_path) else 0,
-            "has_metric_cloud": os.path.exists(os.path.join(DATA_DIR, "models", "actionable_threat_map_cloud.ply")),
-            "calibration": _read_calibration(os.path.join(DATA_DIR, "flight_telemetry.json"))
-        }
-    return {"exists": False, "filename": None, "is_mesh": False}
 
-from pydantic import BaseModel
-from change_detector import change_detector, extract_telemetry_bounds
-try:
-    from georeference import load_point_cloud
-except ImportError:
-    from backend.georeference import load_point_cloud
+class RecalibrateRequest(BaseModel):
+    force: bool = True
 
-BASELINES_DIR = os.path.join(DATA_DIR, "baselines")
-os.makedirs(BASELINES_DIR, exist_ok=True)
+
+@app.post("/api/model/recalibrate")
+def recalibrate(req: Optional[RecalibrateRequest] = None):
+    try:
+        with _terrain_lock:
+            out = RC.recalibrate_active_model(DATA_DIR, force=bool(req.force if req else True), log=pipeline_mgr.add_log)
+            T._MEM.clear()
+        return jr(out)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/model/rtk")
+async def apply_rtk_positions(rtk_file: UploadFile = File(...)):
+    """Re-georeferences the current mission with RTK / PPK positions (RTKLIB .pos or CSV)."""
+    ext = os.path.splitext(rtk_file.filename or "")[1].lower() or ".pos"
+    path = os.path.join(UPLOADS_DIR, f"rtk_input{ext}")
+    with open(path, "wb") as buf:
+        shutil.copyfileobj(rtk_file.file, buf)
+    try:
+        with _terrain_lock:
+            out = RC.recalibrate_active_model(DATA_DIR, force=True, log=pipeline_mgr.add_log, rtk_path=path)
+            T._MEM.clear()
+        _he_cache.clear()
+        _bld_cache.clear()
+        return jr(out)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
 
 class MeshifyRequest(BaseModel):
     baseline_id: Optional[str] = None
 
-class SaveBaselineRequest(BaseModel):
-    name: Optional[str] = None
 
-class CompareRequest(BaseModel):
-    baseline_id: str
-    height_threshold: float = 1.5
+_mesh_job = {"status": "idle", "percent": 0, "message": "", "result": None, "error": None, "started": None}
+_mesh_lock = threading.Lock()
 
-class HeightRestrictionRequest(BaseModel):
-    max_height_m: float = 5.0
-    datum_mode: str = "ground"
-    baseline_id: Optional[str] = None
+
+def _mesh_paths(baseline_id):
+    if baseline_id:
+        bdir = os.path.join(BASELINES_DIR, baseline_id)
+        if not os.path.isdir(bdir):
+            raise HTTPException(status_code=404, detail=f"Baseline '{baseline_id}' not found.")
+        src = os.path.join(bdir, "model_cloud.ply") if os.path.exists(os.path.join(bdir, "model_cloud.ply")) else os.path.join(bdir, "model.ply")
+        return src, os.path.join(bdir, "mesh.ply"), os.path.join(bdir, "mesh.obj"), os.path.join(bdir, "mesh.glb"), \
+            f"data/baselines/{baseline_id}/mesh.ply"
+    src = os.path.join(MODELS_DIR, "actionable_threat_map_points.ply")
+    if not os.path.exists(src):
+        src = os.path.join(MODELS_DIR, "actionable_threat_map.ply")
+    return src, os.path.join(MODELS_DIR, "actionable_threat_mesh.ply"), os.path.join(MODELS_DIR, "actionable_threat_mesh.obj"), \
+        os.path.join(MODELS_DIR, "actionable_threat_mesh.glb"), "data/models/actionable_threat_mesh.ply"
+
+
+def _run_mesh_job(baseline_id):
+    try:
+        src, ply, obj, glb, url = _mesh_paths(baseline_id)
+
+        def prog(p, msg):
+            with _mesh_lock:
+                _mesh_job.update(percent=int(p), message=msg)
+
+        stats = generate_blender_surface_mesh(src, ply, obj, baseline_id=baseline_id, output_glb_path=glb,
+                                              progress=prog, log=pipeline_mgr.add_log)
+        if baseline_id:
+            meta_path = os.path.join(BASELINES_DIR, baseline_id, "metadata.json")
+            meta = _read_json(meta_path)
+            if meta is not None:
+                meta.update(has_mesh=True, mesh_vertices=stats["vertices"], mesh_triangles=stats["triangles"])
+                with open(meta_path, "w", encoding="utf-8") as f:
+                    json.dump(meta, f, indent=2)
+        with _mesh_lock:
+            _mesh_job.update(status="completed", percent=100, message="Mesh ready",
+                             result=clean(dict(stats, mesh_ply_url=url, baseline_id=baseline_id)))
+    except Exception as e:
+        with _mesh_lock:
+            _mesh_job.update(status="failed", error=f"{type(e).__name__}: {e}", message="Mesh synthesis failed")
+
 
 @app.post("/api/model/meshify")
-def convert_to_ultra_mesh(req: Optional[MeshifyRequest] = None):
-    """
-    On-demand endpoint: Converts point cloud into a solid 3D polygon surface mesh
-    (Blender 3D model) using High-Fidelity Ball Pivoting Algorithm (BPA).
-    Connects strictly nearby dots without creating artificial blobs or bridging empty space.
-    Supports both the active mission scan and any selected baseline archive.
-    """
-    baseline_id = req.baseline_id if (req and req.baseline_id) else None
+def start_meshify(req: Optional[MeshifyRequest] = None):
+    baseline_id = req.baseline_id if req else None
+    src, *_ = _mesh_paths(baseline_id)
+    if not os.path.exists(src):
+        raise HTTPException(status_code=404, detail="No point cloud to mesh.")
+    with _mesh_lock:
+        if _mesh_job["status"] == "running":
+            raise HTTPException(status_code=409, detail="A mesh is already being built.")
+        _mesh_job.update(status="running", percent=1, message="Starting", result=None, error=None, started=time.time())
+    threading.Thread(target=_run_mesh_job, args=(baseline_id,), daemon=True).start()
+    return {"success": True, "status": "running"}
 
-    if baseline_id:
-        baseline_dir = os.path.join(BASELINES_DIR, baseline_id)
-        if not os.path.exists(baseline_dir):
-            raise HTTPException(status_code=404, detail=f"Baseline '{baseline_id}' not found.")
-        src_ply = os.path.join(baseline_dir, "model.ply")
-        mesh_ply = os.path.join(baseline_dir, "mesh.ply")
-        obj_path = os.path.join(baseline_dir, "mesh.obj")
-        if not os.path.exists(src_ply):
-            raise HTTPException(status_code=404, detail=f"No 3D model found in baseline '{baseline_id}'.")
-        try:
-            from pipeline_manager import generate_blender_surface_mesh
-            stats = generate_blender_surface_mesh(src_ply, mesh_ply, obj_path)
-            # Update baseline metadata.json
-            meta_path = os.path.join(baseline_dir, "metadata.json")
-            if os.path.exists(meta_path):
-                try:
-                    with open(meta_path, "r", encoding="utf-8") as f:
-                        meta = json.load(f)
-                    meta["has_mesh"] = True
-                    meta["mesh_vertices"] = stats["vertices"]
-                    meta["mesh_triangles"] = stats["triangles"]
-                    with open(meta_path, "w", encoding="utf-8") as f:
-                        json.dump(meta, f, indent=4)
-                except Exception:
-                    pass
-            return {
-                "success": True,
-                "message": f"Solid 3D mesh synthesized for baseline '{baseline_id}': {stats['vertices']:,} vertices, {stats['triangles']:,} polygonal faces.",
-                "vertices": stats["vertices"],
-                "triangles": stats["triangles"],
-                "has_obj": os.path.exists(obj_path),
-                "obj_size_bytes": os.path.getsize(obj_path) if os.path.exists(obj_path) else 0,
-                "mesh_ply_url": f"data/baselines/{baseline_id}/mesh.ply",
-                "points_ply_url": f"data/baselines/{baseline_id}/model.ply",
-                "baseline_id": baseline_id
-            }
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Mesh synthesis failed: {str(e)}")
-    else:
-        points_ply = os.path.join(DATA_DIR, "models", "actionable_threat_map_points.ply")
-        active_ply = os.path.join(DATA_DIR, "models", "actionable_threat_map.ply")
-        obj_path = os.path.join(DATA_DIR, "models", "actionable_threat_mesh.obj")
-        mesh_ply = os.path.join(DATA_DIR, "models", "actionable_threat_mesh.ply")
 
-        # Ensure points_ply is preserved
-        if not os.path.exists(points_ply) and os.path.exists(active_ply):
-            shutil.copy2(active_ply, points_ply)
+@app.get("/api/model/meshify/status")
+def meshify_status():
+    with _mesh_lock:
+        job = dict(_mesh_job)
+    if job.get("started"):
+        job["elapsed_s"] = round(time.time() - job["started"], 1)
+    return jr(job)
 
-        src_ply = points_ply if os.path.exists(points_ply) else active_ply
-        if not os.path.exists(src_ply):
-            raise HTTPException(status_code=404, detail="No active 3D model found to meshify.")
-
-        try:
-            from pipeline_manager import generate_blender_surface_mesh
-            stats = generate_blender_surface_mesh(src_ply, mesh_ply, obj_path)
-            return {
-                "success": True,
-                "message": f"Solid 3D mesh generated: {stats['vertices']:,} vertices, {stats['triangles']:,} polygonal faces.",
-                "vertices": stats["vertices"],
-                "triangles": stats["triangles"],
-                "has_obj": os.path.exists(obj_path),
-                "obj_size_bytes": os.path.getsize(obj_path) if os.path.exists(obj_path) else 0,
-                "mesh_ply_url": "data/models/actionable_threat_mesh.ply",
-                "points_ply_url": "data/models/actionable_threat_map_points.ply",
-                "baseline_id": None
-            }
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Mesh synthesis failed: {str(e)}")
 
 @app.get("/api/model/download/{fmt}")
 def download_model(fmt: str, baseline_id: Optional[str] = None):
-    """
-    Direct export endpoint for Blender OBJ or meshed PLY, supporting active recon or baseline models.
-    """
-    fmt_lower = fmt.lower()
+    fmt = fmt.lower().lstrip(".")
     if baseline_id:
-        baseline_dir = os.path.join(BASELINES_DIR, baseline_id)
-        if fmt_lower in ("obj", ".obj"):
-            path = os.path.join(baseline_dir, "mesh.obj")
-            filename = f"{baseline_id}_mesh.obj"
-            media_type = "text/plain"
-        elif fmt_lower in ("ply", ".ply"):
-            path = os.path.join(baseline_dir, "model.ply")
-            filename = f"{baseline_id}_model.ply"
-            media_type = "application/octet-stream"
-        else:
-            raise HTTPException(status_code=400, detail=f"Unsupported format '{fmt}'. Use 'obj' or 'ply'.")
-        if not os.path.exists(path):
-            raise HTTPException(status_code=404, detail=f"Requested baseline file not found.")
-        return FileResponse(path, filename=filename, media_type=media_type)
-
-    if fmt_lower in ("obj", ".obj"):
-        path = os.path.join(DATA_DIR, "models", "actionable_threat_mesh.obj")
-        filename = "prism_tactical_twin_mesh.obj"
-        media_type = "text/plain"
-    elif fmt_lower in ("ply", ".ply"):
-        path = os.path.join(DATA_DIR, "models", "actionable_threat_map.ply")
-        filename = "prism_tactical_twin_mesh.ply"
-        media_type = "application/octet-stream"
+        bdir = os.path.join(BASELINES_DIR, baseline_id)
+        files = {"obj": ("mesh.obj", "text/plain"), "ply": ("mesh.ply", "application/octet-stream"),
+                 "glb": ("mesh.glb", "model/gltf-binary"), "points": ("model.ply", "application/octet-stream")}
+        if fmt not in files:
+            raise HTTPException(status_code=400, detail="Use obj, ply, glb or points.")
+        path = os.path.join(bdir, files[fmt][0])
+        name = f"{baseline_id}_{files[fmt][0]}"
     else:
-        raise HTTPException(status_code=400, detail=f"Unsupported format '{fmt}'. Use 'obj' or 'ply'.")
-
+        files = {"obj": ("actionable_threat_mesh.obj", "text/plain"), "ply": ("actionable_threat_mesh.ply", "application/octet-stream"),
+                 "glb": ("actionable_threat_mesh.glb", "model/gltf-binary"),
+                 "points": ("actionable_threat_map_points.ply", "application/octet-stream")}
+        if fmt not in files:
+            raise HTTPException(status_code=400, detail="Use obj, ply, glb or points.")
+        path = os.path.join(MODELS_DIR, files[fmt][0])
+        name = "prism_" + files[fmt][0].replace("actionable_threat_", "")
     if not os.path.exists(path):
-        ply_path = os.path.join(DATA_DIR, "models", "actionable_threat_map.ply")
-        if fmt_lower in ("obj", ".obj") and os.path.exists(ply_path):
-            try:
-                from pipeline_manager import generate_blender_surface_mesh
-                generate_blender_surface_mesh(ply_path, ply_path, path)
-            except Exception as e:
-                raise HTTPException(status_code=500, detail=f"Failed synthesizing OBJ: {e}")
-        else:
-            raise HTTPException(status_code=404, detail=f"Model file in format '{fmt}' not yet generated.")
+        raise HTTPException(status_code=404, detail=f"No {fmt.upper()} file yet. Build the mesh first.")
+    return FileResponse(path, filename=name, media_type=files[fmt][1])
 
-    return FileResponse(path, filename=filename, media_type=media_type)
 
-@app.get("/api/baseline/{baseline_id}/srt")
-def get_baseline_srt(baseline_id: str):
-    """
-    Returns the flight telemetry SRT file for a specific baseline.
-    """
-    baseline_dir = os.path.join(BASELINES_DIR, baseline_id)
-    if not os.path.exists(baseline_dir):
-        raise HTTPException(status_code=404, detail="Baseline not found.")
-    srt_path = os.path.join(baseline_dir, "telemetry.srt")
-    if not os.path.exists(srt_path):
-        telem_path = os.path.join(baseline_dir, "telemetry.json")
-        if os.path.exists(telem_path):
-            try:
-                with open(telem_path, "r", encoding="utf-8") as f:
-                    telem = json.load(f)
-                waypoints = telem.get("waypoints", [])
-                if waypoints:
-                    with open(srt_path, "w", encoding="utf-8") as out:
-                        for i, wp in enumerate(waypoints):
-                            sh = i // 3600
-                            sm = (i % 3600) // 60
-                            ss = i % 60
-                            eh = (i + 1) // 3600
-                            em = ((i + 1) % 3600) // 60
-                            es = (i + 1) % 60
-                            lat = wp.get("latitude", 0.0)
-                            lon = wp.get("longitude", 0.0)
-                            alt = wp.get("relative_altitude_m", 0.0)
-                            fid = wp.get("frame_id", i)
-                            out.write(f"{i + 1}\n{sh:02d}:{sm:02d}:{ss:02d},000 --> {eh:02d}:{em:02d}:{es:02d},000\n[FRAME {fid}] LAT: {lat:.6f}, LON: {lon:.6f}, REL_ALT: {alt:.2f}m\n\n")
-            except Exception as e:
-                raise HTTPException(status_code=500, detail=f"Could not generate SRT: {e}")
-        else:
-            raise HTTPException(status_code=404, detail="No telemetry available for this baseline.")
-    return FileResponse(srt_path, filename=f"{baseline_id}_telemetry.srt", media_type="text/plain")
+# =============================================================================
+# terrain, measurement, inventory
+# =============================================================================
+@app.get("/api/terrain/summary")
+def terrain_summary(baseline_id: Optional[str] = None):
+    tm, _, telem = terrain_for(baseline_id)
+    s = tm.summary()
+    s["grid"] = {"x0": tm.x0, "z0": tm.z0, "res": tm.res, "nx": tm.nx, "nz": tm.nz}
+    s["calibration"] = _calibration(telem)
+    return jr(s)
 
-active_diff_state = {
-    "status": "idle",
-    "data": None
-}
 
-@app.post("/api/baseline/save")
-def save_active_as_baseline(req: Optional[SaveBaselineRequest] = None):
-    """
-    Archives active 3D model and telemetry into a designated baseline slot.
-    Avoids hoarding all scans - only models explicitly saved are kept.
-    """
-    active_ply = os.path.join(DATA_DIR, "models", "actionable_threat_map.ply")
-    active_cloud = os.path.join(DATA_DIR, "models", "actionable_threat_map_cloud.ply")
-    active_telem = os.path.join(DATA_DIR, "flight_telemetry.json")
+def _png(img_rgba):
+    import cv2
+    bgra = cv2.cvtColor(np.ascontiguousarray(img_rgba), cv2.COLOR_RGBA2BGRA)
+    ok, buf = cv2.imencode(".png", bgra)
+    return "data:image/png;base64," + base64.b64encode(buf.tobytes()).decode("ascii")
 
-    if not os.path.exists(active_ply):
-        raise HTTPException(status_code=404, detail="No active 3D model found to archive as baseline.")
 
-    from datetime import datetime
-    baseline_id = f"baseline_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    baseline_folder = os.path.join(BASELINES_DIR, baseline_id)
-    os.makedirs(baseline_folder, exist_ok=True)
+def _colormap(values, vmin, vmax, alpha_mask, cmap="turbo"):
+    import cv2
+    v = np.clip((np.nan_to_num(values, nan=vmin) - vmin) / max(vmax - vmin, 1e-9), 0, 1)
+    cm = {"turbo": cv2.COLORMAP_TURBO, "magma": cv2.COLORMAP_MAGMA, "viridis": cv2.COLORMAP_VIRIDIS}[cmap]
+    rgb = cv2.applyColorMap((v * 255).astype(np.uint8), cm)[..., ::-1]
+    a = np.where(alpha_mask, 190, 0).astype(np.uint8)
+    return np.dstack([rgb, a])
 
-    dest_ply = os.path.join(baseline_folder, "model.ply")
-    shutil.copy2(active_ply, dest_ply)
 
-    # Metric, never-meshed point cloud used for height measurement
-    has_metric_cloud = os.path.exists(active_cloud)
-    if has_metric_cloud:
-        shutil.copy2(active_cloud, os.path.join(baseline_folder, "model_cloud.ply"))
+class ObserverIn(BaseModel):
+    x: float
+    z: float
+    eye_h: float = 1.7
 
-    # Archive solid mesh if present
-    active_mesh = os.path.join(DATA_DIR, "models", "actionable_threat_mesh.ply")
-    active_obj = os.path.join(DATA_DIR, "models", "actionable_threat_mesh.obj")
-    has_mesh = False
-    if os.path.exists(active_mesh):
-        shutil.copy2(active_mesh, os.path.join(baseline_folder, "mesh.ply"))
-        has_mesh = True
-    if os.path.exists(active_obj):
-        shutil.copy2(active_obj, os.path.join(baseline_folder, "mesh.obj"))
 
-    dest_telem = os.path.join(baseline_folder, "telemetry.json")
-    telem_bounds = None
-    if os.path.exists(active_telem):
-        shutil.copy2(active_telem, dest_telem)
-        telem_bounds = extract_telemetry_bounds(active_telem)
+@app.get("/api/terrain/layer/{name}")
+def terrain_layer(name: str, baseline_id: Optional[str] = None):
+    """Top-down (north-up) analysis layer as a PNG data URL plus its placement in the model frame."""
+    tm, _, _ = terrain_for(baseline_id)
+    grid = tm
+    if name == "classes":
+        img = tm.class_image()
+    elif name == "heights":
+        img = _colormap(tm.ndsm, 0.0, 20.0, tm.observed & (np.nan_to_num(tm.ndsm) > 0.5))
+    elif name == "slope":
+        img = _colormap(tm.slope, 0.0, 30.0, tm.roi, "magma")
+    elif name == "ortho":
+        img = np.dstack([np.clip(tm.rgb, 0, 255).astype(np.uint8), np.where(tm.observed, 255, 0).astype(np.uint8)])
+    elif name == "exposure":
+        grid = tm.coarsen(max(1, int(round(1.0 / tm.res))))
+        expo, _ = TA.exposure_map(grid, TA.default_observers(grid))
+        img = _colormap(expo, 0.0, 1.0, grid.roi, "turbo")
+    else:
+        raise HTTPException(status_code=404, detail="Unknown layer. Use classes, heights, slope, ortho or exposure.")
+    return jr({"name": name, "image": _png(img), "x0": grid.x0, "z0": grid.z0, "res": grid.res,
+               "nx": grid.nx, "nz": grid.nz, "legend": {"classes": T.CLASS_NAMES}})
 
-    # Archive or generate telemetry.srt for baseline
-    dest_srt = os.path.join(baseline_folder, "telemetry.srt")
-    active_srt = os.path.join(DATA_DIR, "flight_telemetry.srt")
-    if not os.path.exists(active_srt):
-        active_srt = os.path.join(DATA_DIR, "drone_flight.srt")
-    has_srt = False
-    if os.path.exists(active_srt):
-        shutil.copy2(active_srt, dest_srt)
-        has_srt = True
-    elif os.path.exists(dest_telem):
-        try:
-            with open(dest_telem, "r", encoding="utf-8") as f:
-                telem_obj = json.load(f)
-            wps = telem_obj.get("waypoints", [])
-            if wps:
-                with open(dest_srt, "w", encoding="utf-8") as out:
-                    for i, wp in enumerate(wps):
-                        sh = i // 3600
-                        sm = (i % 3600) // 60
-                        ss = i % 60
-                        eh = (i + 1) // 3600
-                        em = ((i + 1) % 3600) // 60
-                        es = (i + 1) % 60
-                        lat = wp.get("latitude", 0.0)
-                        lon = wp.get("longitude", 0.0)
-                        alt = wp.get("relative_altitude_m", 0.0)
-                        fid = wp.get("frame_id", i)
-                        out.write(f"{i + 1}\n{sh:02d}:{sm:02d}:{ss:02d},000 --> {eh:02d}:{em:02d}:{es:02d},000\n[FRAME {fid}] LAT: {lat:.6f}, LON: {lon:.6f}, REL_ALT: {alt:.2f}m\n\n")
-                has_srt = True
-        except Exception:
-            pass
 
-    size_bytes = os.path.getsize(dest_ply)
-    vertex_count = 0
-    try:
-        with open(dest_ply, "rb") as f:
-            for _ in range(35):
-                line = f.readline().decode("ascii", errors="ignore").strip()
-                if line.startswith("element vertex"):
-                    vertex_count = int(line.split()[-1])
-                elif line == "end_header":
-                    break
-    except Exception:
-        pass
+@app.get("/api/terrain/grid")
+def terrain_grid(baseline_id: Optional[str] = None, max_cells: int = 200):
+    """Down-sampled bare-earth heights (for draping analysis layers on the terrain)."""
+    tm, _, _ = terrain_for(baseline_id)
+    f = max(1, int(math.ceil(max(tm.nx, tm.nz) / max(16, min(max_cells, 512)))))
+    dtm = tm.dtm[::f, ::f]
+    return jr({"x0": tm.x0 + 0.5 * tm.res, "z0": tm.z0 + 0.5 * tm.res, "dx": tm.res * f, "nx": dtm.shape[1],
+               "nz": dtm.shape[0], "heights": np.round(dtm, 2).ravel().tolist(),
+               "extent": [tm.nx * tm.res, tm.nz * tm.res]})
 
-    name = req.name if (req and req.name) else f"Sector Recon Baseline ({datetime.now().strftime('%b %d, %H:%M')})"
-    meta = {
-        "id": baseline_id,
-        "name": name,
-        "created_at": datetime.now().isoformat(),
-        "size_bytes": size_bytes,
-        "size_mb": round(size_bytes / (1024 * 1024), 2),
-        "vertex_count": vertex_count,
-        "telemetry_bounds": telem_bounds,
-        "has_metric_cloud": has_metric_cloud,
-        "has_mesh": has_mesh,
-        "has_srt": has_srt,
-        "calibration": _read_calibration(dest_telem) if os.path.exists(dest_telem) else None
+
+class PointReq(BaseModel):
+    x: float
+    z: float
+    y: Optional[float] = None
+    baseline_id: Optional[str] = None
+
+
+class TwoPointReq(BaseModel):
+    p1: List[float]
+    p2: List[float]
+    baseline_id: Optional[str] = None
+
+
+_he_cache = {}
+
+
+def height_engine(baseline_id=None):
+    tm, pts, telem = terrain_for(baseline_id)
+    key = (id(tm), pts["path"])
+    if key not in _he_cache:
+        _he_cache.clear()
+        _he_cache[key] = HE.HeightEngine(tm, pts["xyz"], pts["rgb"], telem)
+    return _he_cache[key]
+
+
+@app.post("/api/measure/height")
+def measure_height(req: PointReq):
+    return jr(height_engine(req.baseline_id).measure_at(req.x, req.z))
+
+
+@app.post("/api/measure/between")
+def measure_between(req: TwoPointReq):
+    return jr(height_engine(req.baseline_id).measure_between(req.p1, req.p2))
+
+
+@app.get("/api/analysis/inventory")
+def inventory(baseline_id: Optional[str] = None):
+    return jr(height_engine(baseline_id).inventory())
+
+
+@app.get("/api/analysis/hag")
+def height_above_ground(file: Optional[str] = None, baseline_id: Optional[str] = None):
+    """Float32 height above the local bare ground for every vertex of `file` (same order as the PLY)."""
+    tm, pts, _ = terrain_for(baseline_id)
+    xyz = pts["xyz"]
+    if file:
+        path = os.path.normpath(os.path.join(PROJECT_ROOT, file))
+        if not path.startswith(DATA_DIR) or not os.path.exists(path):
+            raise HTTPException(status_code=404, detail="Unknown model file.")
+        if os.path.normcase(path) != os.path.normcase(pts["path"]):
+            xyz = plyio.read_ply(path).xyz
+    hag = (xyz[:, 1] - tm.sample(tm.dtm, xyz[:, 0], xyz[:, 2])).astype("<f4")
+    return Response(content=hag.tobytes(), media_type="application/octet-stream")
+
+
+# =============================================================================
+# roads & potholes
+# =============================================================================
+ROAD_CACHE = os.path.join(DATA_DIR, "road_pothole_audit.json")
+
+
+def build_road_report(baseline_id=None):
+    tm, pts, telem = terrain_for(baseline_id)
+    t0 = time.time()
+    roads = RE.detect_roads(tm, log=pipeline_mgr.add_log)
+    potholes, st = RE.detect_potholes(tm, pts["xyz"], roads["mask"], telem, log=pipeline_mgr.add_log)
+    summ = roads["summary"]
+    score = RE.condition_score(potholes, summ["road_area_m2"], st.get("noise_sigma_m"))
+    segs = roads["segments"]
+    area_by = {}
+    for s in segs:
+        area_by[s["surface"]] = area_by.get(s["surface"], 0.0) + s["area_m2"]
+    surface = max(area_by, key=area_by.get) if area_by else None
+    n_high = sum(p["severity"] == "HIGH" for p in potholes)
+    n_med = sum(p["severity"] == "MEDIUM" for p in potholes)
+    if not segs:
+        status, advisory = "NO_ROAD", "No road surface was found in the surveyed area."
+    elif n_high >= 2:
+        status, advisory = "CRITICAL", "Several deep potholes: wheeled convoys should slow to 10-15 km/h and steer around marked hazards."
+    elif n_high or n_med:
+        status, advisory = "CAUTION", "Isolated potholes: reduce speed near marked hazards."
+    else:
+        status, advisory = "PASSABLE", "No potholes deeper than the detection limit on the measured road surface."
+    min_w = min((s["width_min_m"] for s in segs), default=None)
+    report = {
+        "compiled": True, "status": status, "tactical_advisory": advisory,
+        "road_classification": {"surface": surface, "surface_label": {"PAVED": "Paved (asphalt / concrete)",
+                                                                        "UNPAVED": "Unpaved (earth / gravel)",
+                                                                        "MIXED": "Mixed surface"}.get(surface, "Unknown"),
+                                "area_by_surface_m2": area_by},
+        "network": summ, "segments": segs, "potholes": potholes, "surface_stats": st,
+        "condition_score": score,
+        "statistics": {"total_potholes": len(potholes), "high": n_high, "medium": n_med,
+                       "low": sum(p["severity"] == "LOW" for p in potholes),
+                       "craters": sum(p.get("kind") == "CRATER" for p in potholes),
+                       "max_depth_cm": max((p["depth_cm"] for p in potholes), default=0.0),
+                       "total_damaged_area_m2": round(sum(p["area_m2"] for p in potholes), 2),
+                       "narrowest_width_m": min_w},
+        "detection_limit_cm": round(100 * st["lod_m"], 1) if st.get("lod_m") else None,
+        "seconds": round(time.time() - t0, 1),
+        "model_key": _model_key(baseline_id),
     }
+    return clean(report)
 
-    meta_path = os.path.join(baseline_folder, "metadata.json")
-    with open(meta_path, "w", encoding="utf-8") as f:
-        json.dump(meta, f, indent=4)
 
-    calib = meta["calibration"] or {}
-    message = f"Successfully archived baseline '{name}' ({meta['size_mb']} MB, {vertex_count:,} vertices)."
-    if not (calib.get("metric") and calib.get("status") == "ok"):
-        message += (" WARNING: this model has no metric calibration (built before the georeferencing upgrade "
-                    "or georeferencing failed), so it cannot be used for height comparison. Re-run the pipeline.")
-    elif calib.get("confidence") == "LOW":
-        message += " NOTE: metric scale is LOW confidence (no usable GPS) - heights depend on the flight altitude."
-    return {
-        "success": True,
-        "message": message,
-        "baseline": meta
-    }
+def _model_key(baseline_id=None):
+    p, _, _ = T._active_paths(DATA_DIR, baseline_id)
+    return f"{p}:{int(os.path.getmtime(p))}" if p and os.path.exists(p) else None
 
-@app.get("/api/baselines")
-def list_baselines():
-    """
-    Returns list of all saved baseline 3D models with metadata.
-    """
-    baselines = []
-    if os.path.exists(BASELINES_DIR):
-        for folder_name in sorted(os.listdir(BASELINES_DIR), reverse=True):
-            folder_path = os.path.join(BASELINES_DIR, folder_name)
-            if os.path.isdir(folder_path):
-                meta_path = os.path.join(folder_path, "metadata.json")
-                item = None
-                if os.path.exists(meta_path):
-                    try:
-                        with open(meta_path, "r", encoding="utf-8") as f:
-                            item = json.load(f)
-                    except Exception:
-                        pass
-                if not item:
-                    ply_path = os.path.join(folder_path, "model.ply")
-                    if os.path.exists(ply_path):
-                        item = {
-                            "id": folder_name,
-                            "name": folder_name,
-                            "created_at": "",
-                            "size_bytes": os.path.getsize(ply_path),
-                            "size_mb": round(os.path.getsize(ply_path) / (1024 * 1024), 2),
-                            "vertex_count": 0
-                        }
-                if item:
-                    item["has_mesh"] = os.path.exists(os.path.join(folder_path, "mesh.ply"))
-                    item["has_srt"] = os.path.exists(os.path.join(folder_path, "telemetry.srt"))
-                    has_vid_file = os.path.exists(os.path.join(folder_path, "video.mp4"))
-                    item["has_video"] = has_vid_file or (item.get("video_url") is not None)
-                    if has_vid_file:
-                        item["video_url"] = f"data/baselines/{folder_name}/video.mp4"
-                    baselines.append(item)
-    return {"count": len(baselines), "baselines": baselines}
-
-from road_pothole_detector import road_pothole_detector
-
-@app.delete("/api/baseline/{baseline_id}")
-def delete_baseline(baseline_id: str):
-    """
-    Deletes an archived baseline to manage disk space.
-    """
-    global active_diff_state
-    folder_path = os.path.join(BASELINES_DIR, baseline_id)
-    if not os.path.exists(folder_path):
-        raise HTTPException(status_code=404, detail="Baseline not found.")
-
-    try:
-        shutil.rmtree(folder_path)
-        if active_diff_state.get("data") and active_diff_state["data"].get("baseline_id") == baseline_id:
-            active_diff_state = {"status": "idle", "data": None}
-        return {"success": True, "message": f"Baseline '{baseline_id}' removed."}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed deleting baseline: {str(e)}")
 
 @app.get("/api/road/audit")
-def get_road_audit(force: bool = False):
-    """
-    BRO (Border Roads Organisation) Tactical Road & Pothole Audit.
-    Classifies road surface (Tar / Bitumen vs Muddy / Unpaved), computes 3D pothole
-    depth measurements (cm), dimensions, severity ratings, and video detections.
-    Decoupled from core 3D pipeline: returns compiled=False if not run yet.
-    """
-    try:
-        cache_file = road_pothole_detector.cache_file
-        if not force and not os.path.exists(cache_file):
-            return JSONResponse(content={
-                "status": "not_compiled",
-                "compiled": False,
-                "message": "Road & Pothole assessment not compiled yet. Decoupled from core 3D pipeline."
-            })
-        report = road_pothole_detector.run_full_audit(force_recompute=force)
-        report["compiled"] = True
-        return JSONResponse(content=report)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Road & Pothole audit failed: {str(e)}")
+def get_road_audit(force: bool = False, baseline_id: Optional[str] = None):
+    if not force:
+        cached = _read_json(ROAD_CACHE)
+        if cached and cached.get("model_key") == _model_key(baseline_id):
+            return jr(cached)
+        return jr({"compiled": False, "status": "not_compiled"})
+    return compile_road_audit(baseline_id)
+
 
 @app.post("/api/road/audit/compile")
 @app.post("/api/road/audit/recompute")
-def compile_road_audit():
-    """
-    On-demand compilation of the road classification and 3D pothole depths.
-    Only executed when operator explicitly clicks 'Compile Road & Potholes'.
-    """
+def compile_road_audit(baseline_id: Optional[str] = None):
+    report = build_road_report(baseline_id)
     try:
-        report = road_pothole_detector.run_full_audit(force_recompute=True)
-        report["compiled"] = True
-        return JSONResponse(content=report)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Road audit compilation failed: {str(e)}")
+        with open(ROAD_CACHE, "w", encoding="utf-8") as f:
+            json.dump(report, f)
+    except OSError:
+        pass
+    return jr(report)
+
+
+# =============================================================================
+# buildings (rooftops, facades, digital-twin blocks)
+# =============================================================================
+_bld_cache = {}
+
+
+def buildings_for(baseline_id=None):
+    key = _model_key(baseline_id)
+    if key in _bld_cache:
+        return _bld_cache[key]
+    sv = EX.Survey(DATA_DIR, baseline_id)
+    disk = os.path.join(sv.dir, "buildings_cache.json")
+    cached = _read_json(disk)
+    if cached and cached.get("model_key") == key and cached.get("v") == 2:
+        _bld_cache.clear()
+        _bld_cache[key] = cached["buildings"]
+        return cached["buildings"]
+    he = height_engine(baseline_id)
+    t0 = time.time()
+    b = clean(BL.extract_buildings(he, log=pipeline_mgr.add_log))
+    pipeline_mgr.add_log(f"[Buildings] {len(b)} buildings analysed in {time.time() - t0:.1f}s")
+    try:
+        with open(disk, "w", encoding="utf-8") as f:
+            json.dump({"model_key": key, "v": 2, "buildings": b}, f)
+    except OSError:
+        pass
+    _bld_cache.clear()
+    _bld_cache[key] = b
+    return b
+
+
+def roads_for(baseline_id=None):
+    cached = _read_json(ROAD_CACHE)
+    if cached and cached.get("model_key") == _model_key(baseline_id):
+        return cached
+    return json.loads(compile_road_audit(baseline_id).body)
+
+
+@app.get("/api/analysis/buildings")
+def analysis_buildings(baseline_id: Optional[str] = None):
+    b = buildings_for(baseline_id)
+    return jr({"summary": BL.summary(b), "buildings": b})
+
+
+# =============================================================================
+# exports & quality report
+# =============================================================================
+EXPORTS = EX.ExportService(DATA_DIR, terrain_for, height_engine, roads_for, buildings_for,
+                           lambda bid: height_engine(bid).inventory(), log=pipeline_mgr.add_log)
+
+
+def _survey_errors(fn):
+    try:
+        return fn()
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/export/catalog")
+def export_catalog(baseline_id: Optional[str] = None):
+    return jr(_survey_errors(lambda: EXPORTS.catalog(baseline_id)))
+
+
+@app.get("/api/export/file/{product}")
+def export_file(product: str, baseline_id: Optional[str] = None, vertical_offset: Optional[float] = None):
+    if product not in EX.PRODUCTS:
+        raise HTTPException(status_code=404, detail=f"Unknown export '{product}'.")
+    if product in ("report_html", "report_json", "package"):
+        # reports change when check points are added: always rebuilt
+        try:
+            sv = EX.Survey(DATA_DIR, baseline_id)
+            stale = os.path.join(sv.export_dir, f"{sv.slug}_{EX.PRODUCTS[product][2]}")
+            if os.path.exists(stale):
+                os.remove(stale)
+        except (FileNotFoundError, OSError):
+            pass
+    path, name, media = _survey_errors(lambda: EXPORTS.build(product, baseline_id, vertical_offset))
+    return FileResponse(path, filename=name, media_type=media)
+
+
+@app.get("/api/quality/report")
+def quality_report(baseline_id: Optional[str] = None):
+    return jr(_survey_errors(lambda: EXPORTS.report(baseline_id)))
+
+
+@app.get("/api/quality/report.html")
+def quality_report_html(baseline_id: Optional[str] = None):
+    import quality as Q
+    from fastapi.responses import HTMLResponse
+    rep = _survey_errors(lambda: EXPORTS.report(baseline_id))
+    sv = EX.Survey(DATA_DIR, baseline_id)
+    return HTMLResponse(Q.render_html(clean(rep), EXPORTS._preview_data_url(sv, baseline_id)))
+
+
+class CheckpointReq(BaseModel):
+    name: Optional[str] = None
+    model: List[float]
+    lat: float
+    lon: float
+    elev: Optional[float] = None
+    vertical_offset: Optional[float] = None
+    baseline_id: Optional[str] = None
+
+
+def _cp_payload(baseline_id, cps):
+    import quality as Q
+    telem = _read_json(EX.Survey(DATA_DIR, baseline_id).telem, {})
+    corr = (telem.get("georeference") or {}).get("control_correction")
+    return {"checkpoints": cps, "stats": Q.checkpoint_stats(cps, corr), "correction": corr}
+
+
+@app.get("/api/quality/checkpoints")
+def list_checkpoints(baseline_id: Optional[str] = None):
+    cps = _survey_errors(lambda: EXPORTS.checkpoints(baseline_id))
+    return jr(_cp_payload(baseline_id, cps))
+
+
+class ControlReq(BaseModel):
+    baseline_id: Optional[str] = None
+    undo: bool = False
+
+
+@app.post("/api/quality/checkpoints/apply")
+def apply_control_points(req: ControlReq):
+    out = _survey_errors(lambda: EXPORTS.apply_control(req.baseline_id, undo=req.undo))
+    with _terrain_lock:                    # cached telemetry (lat/lon of every result) must follow
+        T._MEM.clear()
+    _he_cache.clear()
+    return jr(dict(out, **_cp_payload(req.baseline_id, out["checkpoints"])))
+
+
+@app.post("/api/quality/checkpoints")
+def add_checkpoint(req: CheckpointReq):
+    import quality as Q
+    if not (-90 <= req.lat <= 90 and -180 <= req.lon <= 180) or len(req.model) != 3:
+        raise HTTPException(status_code=400, detail="Give latitude/longitude in decimal degrees and a picked model point.")
+    cp = _survey_errors(lambda: EXPORTS.add_checkpoint(req.baseline_id, req.name, req.model, req.lat, req.lon,
+                                                       req.elev, req.vertical_offset))
+    return jr(dict(_cp_payload(req.baseline_id, EXPORTS.checkpoints(req.baseline_id)), checkpoint=cp))
+
+
+@app.delete("/api/quality/checkpoints/{index}")
+def delete_checkpoint(index: int, baseline_id: Optional[str] = None):
+    import quality as Q
+    cps = _survey_errors(lambda: EXPORTS.delete_checkpoint(baseline_id, index))
+    return jr(_cp_payload(baseline_id, cps))
+
+
+# =============================================================================
+# planning: base sites & covert routes
+# =============================================================================
+class SitesRequest(BaseModel):
+    radius_m: float = 15.0
+    min_building_dist_m: float = 150.0
+    max_slope_deg: float = 6.0
+    max_road_dist_m: float = 500.0
+    top_k: int = 5
+    observers: Optional[List[ObserverIn]] = None
+    use_default_observers: bool = True
+    baseline_id: Optional[str] = None
+
+
+class RouteRequest(BaseModel):
+    start: List[float]
+    end: List[float]
+    observers: Optional[List[ObserverIn]] = None
+    use_default_observers: bool = True
+    include_road_observers: bool = False
+    max_slope_deg: float = 35.0
+    baseline_id: Optional[str] = None
+
+
+def _observers(grid, custom, use_default, include_roads=False):
+    obs = TA.default_observers(grid, include_roads=include_roads) if use_default else []
+    for o in custom or []:
+        obs.append({"x": o.x, "z": o.z, "eye_h": o.eye_h, "kind": "operator"})
+    return obs
+
+
+@app.post("/api/analysis/sites")
+def base_sites(req: SitesRequest):
+    tm, _, telem = terrain_for(req.baseline_id)
+    grid = tm.coarsen(max(1, int(round(1.0 / tm.res))))
+    obs = _observers(grid, req.observers, req.use_default_observers)
+    out = TA.find_base_sites(tm, telem, radius_m=req.radius_m, min_building_dist_m=req.min_building_dist_m,
+                             max_slope_deg=req.max_slope_deg, max_road_dist_m=req.max_road_dist_m,
+                             top_k=max(1, min(req.top_k, 10)), observers=obs, log=pipeline_mgr.add_log)
+    return jr(out)
+
+
+@app.post("/api/analysis/route")
+def covert_route(req: RouteRequest):
+    if len(req.start) < 2 or len(req.end) < 2:
+        raise HTTPException(status_code=400, detail="start and end need [x, y, z] model coordinates.")
+    tm, _, telem = terrain_for(req.baseline_id)
+    grid = TA._grid_for_routes(tm)
+    obs = _observers(grid, req.observers, req.use_default_observers, req.include_road_observers)
+    out = TA.plan_routes(tm, telem, req.start, req.end, observers=obs, max_slope_deg=req.max_slope_deg,
+                         log=pipeline_mgr.add_log)
+    return jr(out)
+
+
+@app.get("/api/analysis/observers")
+def list_observers(baseline_id: Optional[str] = None, include_roads: bool = False):
+    tm, _, _ = terrain_for(baseline_id)
+    grid = tm.coarsen(max(1, int(round(1.0 / tm.res))))
+    obs = TA.default_observers(grid, include_roads=include_roads)
+    for o in obs:
+        o["y"] = float(grid.sample(grid.dtm, o["x"], o["z"]))
+    return jr({"observers": obs})
+
+
+# =============================================================================
+# baselines & change detection
+# =============================================================================
+class SaveBaselineRequest(BaseModel):
+    name: Optional[str] = None
+    keep_video: bool = True
+
+
+class CompareRequest(BaseModel):
+    earlier: Optional[str] = None            # day 1: a saved survey id or "active"
+    later: Optional[str] = None              # day 2: a saved survey id or "active" (default: the current mission)
+    min_height_m: float = 0.5
+    min_area_m2: float = 2.0
+    baseline_id: Optional[str] = None        # legacy form: baseline (day 1) vs the current mission
+    height_threshold: Optional[float] = None
+
+
+active_diff_state = {"status": "idle", "data": None}
+
+
+def _write_srt_from_waypoints(telem, path):
+    wps = telem.get("waypoints") or []
+    if not wps:
+        return False
+    with open(path, "w", encoding="utf-8") as out:
+        for i, wp in enumerate(wps):
+            t0 = wp.get("time_s", float(i))
+            t1 = wps[i + 1].get("time_s", t0 + 1.0) if i + 1 < len(wps) else t0 + 1.0
+
+            def ts(t):
+                h, r = divmod(t, 3600)
+                m, s = divmod(r, 60)
+                return f"{int(h):02d}:{int(m):02d}:{int(s):02d},{int(round((s - int(s)) * 1000)):03d}"
+            out.write(f"{i + 1}\n{ts(t0)} --> {ts(t1)}\n[latitude: {wp.get('latitude', 0):.8f}] "
+                      f"[longitude: {wp.get('longitude', 0):.8f}] [rel_alt: {wp.get('relative_altitude_m', 0) or 0:.3f}]\n\n")
+    return True
+
+
+@app.get("/api/baseline/{baseline_id}/srt")
+def get_baseline_srt(baseline_id: str):
+    bdir = os.path.join(BASELINES_DIR, baseline_id)
+    if not os.path.isdir(bdir):
+        raise HTTPException(status_code=404, detail="Baseline not found.")
+    srt = os.path.join(bdir, "telemetry.srt")
+    if not os.path.exists(srt):
+        telem = _read_json(os.path.join(bdir, "telemetry.json"), {})
+        if not _write_srt_from_waypoints(telem, srt):
+            raise HTTPException(status_code=404, detail="No telemetry for this baseline.")
+    return FileResponse(srt, filename=f"{baseline_id}_telemetry.srt", media_type="text/plain")
+
+
+@app.post("/api/baseline/save")
+def save_active_as_baseline(req: Optional[SaveBaselineRequest] = None):
+    from datetime import datetime
+    pts = os.path.join(MODELS_DIR, "actionable_threat_map_points.ply")
+    if not os.path.exists(pts):
+        pts = os.path.join(MODELS_DIR, "actionable_threat_map.ply")
+    if not os.path.exists(pts):
+        raise HTTPException(status_code=404, detail="No active 3D model to archive.")
+    bid = f"baseline_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    bdir = os.path.join(BASELINES_DIR, bid)
+    os.makedirs(bdir, exist_ok=True)
+    shutil.copy2(pts, os.path.join(bdir, "model.ply"))
+    cloud = os.path.join(MODELS_DIR, "actionable_threat_map_cloud.ply")
+    has_cloud = os.path.exists(cloud)
+    if has_cloud:
+        shutil.copy2(cloud, os.path.join(bdir, "model_cloud.ply"))
+    has_mesh = False
+    for src, dst in (("actionable_threat_mesh.ply", "mesh.ply"), ("actionable_threat_mesh.obj", "mesh.obj"),
+                     ("actionable_threat_mesh.glb", "mesh.glb")):
+        if os.path.exists(os.path.join(MODELS_DIR, src)):
+            shutil.copy2(os.path.join(MODELS_DIR, src), os.path.join(bdir, dst))
+            has_mesh = has_mesh or dst == "mesh.ply"
+    telem_src = os.path.join(DATA_DIR, "flight_telemetry.json")
+    telem = _read_json(telem_src, {})
+    bounds = None
+    if os.path.exists(telem_src):
+        shutil.copy2(telem_src, os.path.join(bdir, "telemetry.json"))
+        bounds = extract_telemetry_bounds(telem_src)
+    fi = os.path.join(DATA_DIR, "workspace", "frame_index.json")
+    if os.path.exists(fi):
+        shutil.copy2(fi, os.path.join(bdir, "frame_index.json"))
+    video = os.path.join(DATA_DIR, "raw_videos", "drone_flight.mp4")
+    if (req is None or req.keep_video) and os.path.exists(video):
+        shutil.copy2(video, os.path.join(bdir, "video.mp4"))
+    from telemetry_parser import srt_matches_telemetry
+    srt_src = next((p for p in (os.path.join(DATA_DIR, "drone_flight.srt"), os.path.join(DATA_DIR, "raw_videos", "drone_flight.srt"))
+                    if os.path.exists(p) and srt_matches_telemetry(p, telem) is not False), None)
+    has_srt = False
+    if srt_src:
+        shutil.copy2(srt_src, os.path.join(bdir, "telemetry.srt"))
+        has_srt = True
+    else:
+        has_srt = _write_srt_from_waypoints(telem, os.path.join(bdir, "telemetry.srt"))
+    v, _ = plyio.ply_counts(os.path.join(bdir, "model.ply"))
+    rep = _read_json(os.path.join(DATA_DIR, "recon_report.json"))
+    if rep and int((rep.get("outputs") or {}).get("points") or v) == int(v):
+        shutil.copy2(os.path.join(DATA_DIR, "recon_report.json"), os.path.join(bdir, "recon_report.json"))
+    for extra in ("checkpoints.json", "preview_topdown.jpg"):
+        if os.path.exists(os.path.join(MODELS_DIR, extra)):
+            shutil.copy2(os.path.join(MODELS_DIR, extra), os.path.join(bdir, extra))
+    name = (req.name if (req and req.name) else f"Survey {datetime.now().strftime('%d %b %Y, %H:%M')}")
+    meta = {"id": bid, "name": name, "created_at": datetime.now().isoformat(),
+            "size_mb": round(os.path.getsize(os.path.join(bdir, "model.ply")) / 1e6, 2), "vertex_count": v,
+            "telemetry_bounds": bounds, "has_metric_cloud": has_cloud, "has_mesh": has_mesh, "has_srt": has_srt,
+            "calibration": _calibration(telem)}
+    with open(os.path.join(bdir, "metadata.json"), "w", encoding="utf-8") as f:
+        json.dump(clean(meta), f, indent=2)
+    cal = meta["calibration"] or {}
+    msg = f"Saved '{name}' ({v:,} points)."
+    if not (cal.get("metric") and cal.get("status") == "ok"):
+        msg += " Warning: this model has no metric calibration, so it cannot be used for height comparison."
+    elif cal.get("confidence") == "LOW":
+        msg += " Note: metric scale confidence is LOW (no usable GPS)."
+    return jr({"success": True, "message": msg, "baseline": meta})
+
+
+@app.get("/api/baselines")
+def list_baselines():
+    out = []
+    for folder in sorted(os.listdir(BASELINES_DIR), reverse=True):
+        bdir = os.path.join(BASELINES_DIR, folder)
+        if not os.path.isdir(bdir):
+            continue
+        item = _read_json(os.path.join(bdir, "metadata.json"))
+        if not item:
+            ply = os.path.join(bdir, "model.ply")
+            if not os.path.exists(ply):
+                continue
+            item = {"id": folder, "name": folder, "created_at": "", "size_mb": round(os.path.getsize(ply) / 1e6, 2),
+                    "vertex_count": plyio.ply_counts(ply)[0]}
+        item["has_mesh"] = os.path.exists(os.path.join(bdir, "mesh.ply"))
+        # file versions: the dashboard adds them to the URLs so a rebuilt model is never taken from a cache
+        item["model_version"] = int(os.path.getmtime(os.path.join(bdir, "model.ply"))) if os.path.exists(os.path.join(bdir, "model.ply")) else 0
+        item["mesh_version"] = int(os.path.getmtime(os.path.join(bdir, "mesh.ply"))) if item["has_mesh"] else 0
+        item["has_srt"] = os.path.exists(os.path.join(bdir, "telemetry.srt"))
+        item["has_cameras"] = os.path.exists(os.path.join(bdir, "frame_index.json"))
+        vid = next((v for v in ("video.mp4", "video.webm") if os.path.exists(os.path.join(bdir, v))), None)
+        if vid:
+            item["video_url"] = f"data/baselines/{folder}/{vid}"
+        elif item.get("video_url") and not os.path.exists(os.path.join(PROJECT_ROOT, item["video_url"])):
+            item["video_url"] = None                  # referenced video was moved or deleted
+        item["has_video"] = bool(item.get("video_url"))
+        out.append(item)
+    return jr({"count": len(out), "baselines": out})
+
+
+@app.delete("/api/baseline/{baseline_id}")
+def delete_baseline(baseline_id: str):
+    global active_diff_state
+    bdir = os.path.normpath(os.path.join(BASELINES_DIR, baseline_id))
+    if not bdir.startswith(BASELINES_DIR) or not os.path.isdir(bdir):
+        raise HTTPException(status_code=404, detail="Baseline not found.")
+    shutil.rmtree(bdir)
+    if (active_diff_state.get("data") or {}).get("baseline_id") == baseline_id:
+        active_diff_state = {"status": "idle", "data": None}
+    return {"success": True, "message": f"Baseline '{baseline_id}' deleted."}
+
+
+def _survey_for_change(sid):
+    """Terrain, points and telemetry of a saved survey or of the current mission ("active")."""
+    bid = None if (not sid or sid == "active") else sid
+    tm, pts, telem = terrain_for(bid)
+    if bid:
+        meta = _read_json(os.path.join(BASELINES_DIR, bid, "metadata.json"), {}) or {}
+        name, date = meta.get("name") or bid, meta.get("created_at")
+    else:
+        name, date = "Current mission", None
+    return {"tm": tm, "xyz": pts["xyz"], "telem": telem, "id": bid or "active", "name": name, "date": date}
+
 
 @app.post("/api/diff/compare")
-def compare_with_baseline(req: CompareRequest):
-    """
-    Executes multi-epoch 3D change detection between active model and chosen baseline.
-    Checks spatial overlap via telemetry; flags vertical structural height increases.
-    """
+def compare_surveys(req: CompareRequest):
+    """Day-1 vs day-2 change detection between any two surveys of the same place."""
+    import change_engine as CE
     global active_diff_state
-    try:
-        result = change_detector.compare_active_against_baseline(
-            baseline_id=req.baseline_id,
-            height_threshold_m=req.height_threshold
-        )
-        active_diff_state = {
-            "status": result["status"],
-            "data": result
-        }
-        return JSONResponse(content=result)
-    except FileNotFoundError as fe:
-        raise HTTPException(status_code=404, detail=str(fe))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Comparison failed: {str(e)}")
+    earlier = req.earlier or req.baseline_id
+    later = req.later or "active"
+    if not earlier:
+        raise HTTPException(status_code=400, detail="Choose the earlier survey (day 1).")
+    if earlier == later:
+        raise HTTPException(status_code=400, detail="Choose two different surveys.")
+    min_h = req.height_threshold if (req.height_threshold is not None and req.earlier is None) else req.min_height_m
+    min_h = float(min(max(min_h, 0.2), 10.0))
+    sa = _survey_for_change(earlier)
+    sb = _survey_for_change(later)
+    result = CE.compare(sa, sb, min_height_m=min_h, min_area_m2=float(max(0.5, req.min_area_m2)), log=pipeline_mgr.add_log)
+    img = result.pop("change_image", None)
+    if img is not None:
+        result["change_layer"] = dict(result.pop("grid"), image=_png(img), name="change")
+    result["earlier"]["date"], result["later"]["date"] = sa["date"], sb["date"]
+    result = clean(result)
+    active_diff_state = {"status": result["status"], "data": {k: v for k, v in result.items() if k != "change_layer"}}
+    return jr(result)
+
 
 @app.get("/api/diff/active")
 def get_active_diff():
-    """
-    Returns current active comparison / alert state.
-    """
-    return JSONResponse(content=active_diff_state)
+    return jr(active_diff_state)
 
+
+# =============================================================================
+# height ceiling audit (height above the LOCAL ground, not a global percentile)
+# =============================================================================
 @app.get("/api/analysis/height-restriction")
 @app.post("/api/analysis/height-restriction")
-def analyze_height_restriction(
-    max_height_m: float = 5.0,
-    datum_mode: str = "ground",
-    baseline_id: Optional[str] = None
-):
-    """
-    Analyzes point cloud against vertical height restriction ceiling.
-    Computes total points, violating points count/ratio, peak elevation, and maximum breach.
-    """
-    import numpy as np
-    try:
-        if baseline_id:
-            baseline_dir = os.path.join(BASELINES_DIR, baseline_id)
-            ply_path = os.path.join(baseline_dir, "model.ply")
-            telem_path = os.path.join(baseline_dir, "telemetry.json")
-        else:
-            ply_path = os.path.join(DATA_DIR, "models", "actionable_threat_map.ply")
-            telem_path = os.path.join(DATA_DIR, "flight_telemetry.json")
+def analyze_height_restriction(max_height_m: float = 5.0, baseline_id: Optional[str] = None):
+    tm, pts, _ = terrain_for(baseline_id)
+    xyz = pts["xyz"]
+    hag = xyz[:, 1] - tm.sample(tm.dtm, xyz[:, 0], xyz[:, 2])
+    breach = hag > max_height_m
+    k = int(np.argmax(hag))
+    return jr({"status": "completed", "max_height_threshold_m": max_height_m, "datum_mode": "local_ground",
+               "total_points": len(xyz), "violating_points": int(breach.sum()),
+               "violation_percent": round(100.0 * float(breach.mean()), 2),
+               "peak_elevation_m": round(float(hag[k]), 2), "max_breach_m": round(max(0.0, float(hag[k]) - max_height_m), 2),
+               "violation_detected": bool(breach.any()),
+               "peak_coordinates": {"x": xyz[k, 0], "y": xyz[k, 1], "z": xyz[k, 2]} if breach.any() else None})
 
-        if not os.path.exists(ply_path):
-            raise FileNotFoundError(f"Point cloud model not found at {ply_path}")
 
-        metric_scale = 1.0
-        if os.path.exists(telem_path):
-            try:
-                with open(telem_path, "r", encoding="utf-8") as f:
-                    telem = json.load(f)
-                    metric_scale = float(telem.get("metric_scale_factor", 1.0))
-            except Exception:
-                metric_scale = 1.0
-
-        pts, _, _ = load_point_cloud(ply_path)
-        if pts is None or len(pts) == 0:
-            return JSONResponse(content={
-                "status": "empty",
-                "total_points": 0,
-                "violating_points": 0,
-                "violation_percent": 0.0,
-                "peak_elevation_m": 0.0,
-                "max_breach_m": 0.0,
-                "violation_detected": False
-            })
-
-        ys = pts[:, 1]
-        if datum_mode == "ground":
-            ground_y = float(np.percentile(ys, 2.0))
-        else:
-            ground_y = 0.0
-
-        elevations_m = (ys - ground_y) * metric_scale
-        breach_mask = elevations_m > max_height_m
-        violating_count = int(np.sum(breach_mask))
-        total_pts = len(pts)
-        peak_elev_m = float(np.max(elevations_m))
-        max_breach_m = max(0.0, peak_elev_m - max_height_m)
-        violation_pct = round((violating_count / total_pts) * 100.0, 2)
-
-        peak_coords = None
-        if violating_count > 0:
-            peak_idx = int(np.argmax(elevations_m))
-            peak_coords = {
-                "x": round(float(pts[peak_idx, 0]), 3),
-                "y": round(float(pts[peak_idx, 1]), 3),
-                "z": round(float(pts[peak_idx, 2]), 3)
-            }
-
-        return JSONResponse(content={
-            "status": "completed",
-            "max_height_threshold_m": float(max_height_m),
-            "datum_mode": datum_mode,
-            "metric_scale_factor": float(metric_scale),
-            "total_points": total_pts,
-            "violating_points": violating_count,
-            "violation_percent": violation_pct,
-            "peak_elevation_m": round(peak_elev_m, 2),
-            "max_breach_m": round(max_breach_m, 2),
-            "violation_detected": violating_count > 0,
-            "peak_coordinates": peak_coords,
-            "timestamp": time.time()
-        })
-    except FileNotFoundError as fe:
-        raise HTTPException(status_code=404, detail=str(fe))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Height restriction analysis failed: {str(e)}")
-
-# =================================================================
-# AUTOMATED RECONSTRUCTION PIPELINE API
-# =================================================================
-
+# =============================================================================
+# missions: local pipeline and Colab bundles
+# =============================================================================
 @app.post("/api/pipeline/start")
 async def start_reconstruction(
-    input_type: str = Form("video"),          # "video" or "frames"
-    has_telemetry: bool = Form(False),        # True or False
-    quality: str = Form("medium"),            # "fast", "medium", "high", "ultra"
-    media_file: UploadFile = File(...),       # .mp4/.mov or .zip
+    input_type: str = Form("video"),
+    has_telemetry: bool = Form(False),
+    quality: str = Form("medium"),
+    media_file: UploadFile = File(...),
     telemetry_file: Optional[UploadFile] = File(None),
-    flight_altitude_m: Optional[float] = Form(None)   # height above ground; used for scale when no GPS log
+    flight_altitude_m: Optional[float] = Form(None),
+    rtk_file: Optional[UploadFile] = File(None),
+    intrinsics_file: Optional[UploadFile] = File(None),
+    imu_file: Optional[UploadFile] = File(None),
+    dynamic_masks: bool = Form(True),
 ):
-    """
-    Accepts video or frames zip along with optional telemetry coordinates,
-    and initiates the asynchronous 3D reconstruction pipeline.
-    """
-    # Verify not currently running
-    current_status = pipeline_mgr.get_status()
-    if current_status["status"] == "running":
-        raise HTTPException(status_code=400, detail="A reconstruction pipeline is already in progress.")
-
-    # Save uploaded media file to uploads directory
-    media_ext = os.path.splitext(media_file.filename or "")[1]
-    saved_media_path = os.path.join(UPLOADS_DIR, f"mission_input_{int(os.path.getmtime(UPLOADS_DIR)) if os.path.exists(UPLOADS_DIR) else 0}{media_ext}")
-    
-    with open(saved_media_path, "wb") as buffer:
-        shutil.copyfileobj(media_file.file, buffer)
-
-    # Save telemetry file if uploaded
-    saved_telemetry_path = None
-    if has_telemetry and telemetry_file:
-        telem_ext = os.path.splitext(telemetry_file.filename or "")[1]
-        saved_telemetry_path = os.path.join(UPLOADS_DIR, f"telemetry_input{telem_ext}")
-        with open(saved_telemetry_path, "wb") as buffer:
-            shutil.copyfileobj(telemetry_file.file, buffer)
-
+    if pipeline_mgr.get_status()["status"] == "running":
+        raise HTTPException(status_code=400, detail="A reconstruction is already running.")
     if flight_altitude_m is not None and not (1.0 <= flight_altitude_m <= 1000.0):
         raise HTTPException(status_code=400, detail="flight_altitude_m must be between 1 and 1000 metres.")
-
-    # Auto-detect if uploaded file is a pre-computed Colab bundle (.ZIP)
-    if saved_media_path.lower().endswith(".zip"):
+    ext = os.path.splitext(media_file.filename or "")[1].lower()
+    # one file per input kind: repeated uploads replace each other instead of piling up gigabytes
+    media_path = os.path.join(UPLOADS_DIR, f"mission_input{ext}")
+    with open(media_path, "wb") as buf:
+        shutil.copyfileobj(media_file.file, buf, length=16 * 1024 * 1024)
+    telem_path = None
+    if has_telemetry and telemetry_file is not None and telemetry_file.filename:
+        telem_path = os.path.join(UPLOADS_DIR, f"telemetry_input{os.path.splitext(telemetry_file.filename)[1].lower()}")
+        with open(telem_path, "wb") as buf:
+            shutil.copyfileobj(telemetry_file.file, buf)
+    extras = {"dynamic_masks": bool(dynamic_masks)}
+    for key, up in (("rtk_path", rtk_file), ("intrinsics_path", intrinsics_file), ("imu_path", imu_file)):
+        if up is not None and up.filename:
+            p = os.path.join(UPLOADS_DIR, f"{key.replace('_path', '')}_input{os.path.splitext(up.filename)[1].lower()}")
+            with open(p, "wb") as buf:
+                shutil.copyfileobj(up.file, buf)
+            extras[key] = p
+    if ext == ".zip":
         try:
-            with zipfile.ZipFile(saved_media_path, "r") as z_check:
-                names_lower = [n.lower() for n in z_check.namelist()]
-                if any("actionable_threat" in n or "flight_telemetry.json" in n for n in names_lower):
-                    result = deploy_colab_bundle(saved_media_path)
-                    return {
-                        "success": True,
-                        "job_id": "colab_bundle_auto_import",
-                        "message": f"Pre-computed Google Colab Package auto-detected and deployed ({result['vertex_count']:,} points, {result['face_count']:,} mesh faces).",
-                        "input_type": "colab",
-                        "has_telemetry": result["has_telemetry"],
-                        "quality": "colab_gpu",
-                        "flight_altitude_m": flight_altitude_m,
-                        "deployed_files": result["deployed_files"],
-                        "vertex_count": result["vertex_count"],
-                        "face_count": result["face_count"]
-                    }
-        except Exception as ze:
-            print(f"[Notice] Media zip check not a colab bundle: {ze}")
-
-    # Trigger background reconstruction
-    success, job_id = pipeline_mgr.start_pipeline(
-        input_type=input_type.lower(),
-        has_telemetry=has_telemetry,
-        quality=quality.lower(),
-        media_path=saved_media_path,
-        telemetry_path=saved_telemetry_path,
-        flight_altitude_m=flight_altitude_m
-    )
-
-    if not success:
+            with zipfile.ZipFile(media_path) as z:
+                names = [n.lower() for n in z.namelist()]
+            if any("actionable_threat" in n or "flight_telemetry.json" in n for n in names):
+                result = deploy_colab_bundle(media_path)
+                return jr(dict(result, success=True, job_id="colab_bundle", input_type="colab"))
+        except zipfile.BadZipFile:
+            raise HTTPException(status_code=400, detail="The .zip file is damaged.")
+    ok, job_id = pipeline_mgr.start_pipeline(input_type=input_type.lower(), has_telemetry=bool(telem_path),
+                                             quality=quality.lower(), media_path=media_path, telemetry_path=telem_path,
+                                             flight_altitude_m=flight_altitude_m, extras=extras)
+    if not ok:
         raise HTTPException(status_code=400, detail=job_id)
+    return {"success": True, "job_id": job_id, "input_type": input_type, "quality": quality,
+            "has_telemetry": bool(telem_path)}
 
-    return {
-        "success": True,
-        "job_id": job_id,
-        "message": f"Pipeline started in {input_type.upper()} mode ({quality.upper()} quality).",
-        "input_type": input_type,
-        "has_telemetry": has_telemetry,
-        "quality": quality,
-        "flight_altitude_m": flight_altitude_m
-    }
 
 @app.get("/api/pipeline/status")
 def get_pipeline_status():
-    """
-    Returns live progress percentage, current stage, and streaming terminal logs.
-    """
-    return JSONResponse(content=pipeline_mgr.get_status())
+    return jr(pipeline_mgr.get_status())
+
 
 @app.post("/api/pipeline/cancel")
 def cancel_pipeline():
-    """
-    Cancels the active reconstruction job.
-    """
-    cancelled = pipeline_mgr.cancel()
-    return {"success": cancelled, "message": "Pipeline cancelled" if cancelled else "No running job to cancel"}
+    ok = pipeline_mgr.cancel()
+    return {"success": ok, "message": "Pipeline cancelled" if ok else "No running job"}
 
 
-def deploy_colab_bundle(zip_path: str) -> dict:
-    """
-    Core engine to unpack and deploy a pre-computed 3D tactical mission bundle
-    generated on Google Colab / Kaggle. Deploys points, mesh, glb, telemetry,
-    and video directly into PRISM active datasets.
-    """
-    if not os.path.exists(zip_path):
-        raise HTTPException(status_code=404, detail=f"Mission bundle file not found: {zip_path}")
-
-    extract_dir = tempfile.mkdtemp(prefix="prism_colab_")
+def deploy_colab_bundle(zip_path):
+    """Unpacks a PRISM-Turbo bundle into the active model slots and verifies its georeferencing."""
+    extract_dir = tempfile.mkdtemp(prefix="prism_bundle_")
     deployed = []
-
     try:
-        with zipfile.ZipFile(zip_path, "r") as z:
+        with zipfile.ZipFile(zip_path) as z:
             z.extractall(extract_dir)
-
-        # Walk extracted files to find target assets regardless of nested subdirectories
-        extracted_map = {}
+        found = {}
         for root, _, files in os.walk(extract_dir):
             for f in files:
-                extracted_map[f.lower()] = os.path.join(root, f)
-
-        models_dir = os.path.join(DATA_DIR, "models")
-        os.makedirs(models_dir, exist_ok=True)
-        raw_videos_dir = os.path.join(DATA_DIR, "raw_videos")
-        os.makedirs(raw_videos_dir, exist_ok=True)
-        workspace_dir = os.path.join(DATA_DIR, "workspace")
-        os.makedirs(workspace_dir, exist_ok=True)
-
-        # 1. Point Cloud (Points)
-        pts_target = os.path.join(models_dir, "actionable_threat_map_points.ply")
-        active_target = os.path.join(models_dir, "actionable_threat_map.ply")
-        if "actionable_threat_map_points.ply" in extracted_map:
-            shutil.copy2(extracted_map["actionable_threat_map_points.ply"], pts_target)
-            shutil.copy2(extracted_map["actionable_threat_map_points.ply"], active_target)
-            deployed.append("actionable_threat_map_points.ply")
-        elif "actionable_threat_map.ply" in extracted_map:
-            shutil.copy2(extracted_map["actionable_threat_map.ply"], pts_target)
-            shutil.copy2(extracted_map["actionable_threat_map.ply"], active_target)
-            deployed.append("actionable_threat_map.ply")
-
-        # 2. Blender Solid 3D Mesh (PLY & OBJ & GLB)
-        if "actionable_threat_mesh.ply" in extracted_map:
-            shutil.copy2(extracted_map["actionable_threat_mesh.ply"], os.path.join(models_dir, "actionable_threat_mesh.ply"))
-            deployed.append("actionable_threat_mesh.ply")
-        if "actionable_threat_mesh.obj" in extracted_map:
-            shutil.copy2(extracted_map["actionable_threat_mesh.obj"], os.path.join(models_dir, "actionable_threat_mesh.obj"))
-            deployed.append("actionable_threat_mesh.obj")
-        if "actionable_threat_mesh.glb" in extracted_map:
-            shutil.copy2(extracted_map["actionable_threat_mesh.glb"], os.path.join(models_dir, "actionable_threat_mesh.glb"))
-            deployed.append("actionable_threat_mesh.glb")
-
-        # 3. Flight Telemetry & GNSS metadata
-        if "flight_telemetry.json" in extracted_map:
-            shutil.copy2(extracted_map["flight_telemetry.json"], os.path.join(DATA_DIR, "flight_telemetry.json"))
-            deployed.append("flight_telemetry.json")
-
-        if "drone_flight.srt" in extracted_map:
-            shutil.copy2(extracted_map["drone_flight.srt"], os.path.join(DATA_DIR, "drone_flight.srt"))
-            shutil.copy2(extracted_map["drone_flight.srt"], os.path.join(raw_videos_dir, "drone_flight.srt"))
-            deployed.append("drone_flight.srt")
-
-        # 4. Frame Timestamps Index
-        if "frame_index.json" in extracted_map:
-            shutil.copy2(extracted_map["frame_index.json"], os.path.join(workspace_dir, "frame_index.json"))
-            deployed.append("frame_index.json")
-
-        # 5. Video Stream
-        for v_name in ("drone_flight.mp4", "flight.mp4", "video.mp4"):
-            if v_name in extracted_map:
-                shutil.copy2(extracted_map[v_name], os.path.join(raw_videos_dir, "drone_flight.mp4"))
-                deployed.append("drone_flight.mp4")
+                found[f.lower()] = os.path.join(root, f)
+        raw_dir = os.path.join(DATA_DIR, "raw_videos")
+        ws_dir = os.path.join(DATA_DIR, "workspace")
+        os.makedirs(raw_dir, exist_ok=True)
+        os.makedirs(ws_dir, exist_ok=True)
+        # the previous mission's derived files must not survive
+        for stale in ("actionable_threat_mesh.ply", "actionable_threat_mesh.obj", "actionable_threat_mesh.glb",
+                      "actionable_threat_map_diff.ply", "actionable_threat_map_cloud.ply", "terrain_cache.npz",
+                      "checkpoints.json", "buildings_cache.json"):
+            p = os.path.join(MODELS_DIR, stale)
+            if os.path.exists(p):
+                os.remove(p)
+        old_backup = os.path.join(MODELS_DIR, "_pre_recalibration")
+        if os.path.isdir(old_backup):
+            os.replace(old_backup, old_backup + time.strftime("_%Y%m%d_%H%M%S"))
+        for p in (ROAD_CACHE,):
+            if os.path.exists(p):
+                os.remove(p)
+        pts_src = found.get("actionable_threat_map_points.ply") or found.get("actionable_threat_map.ply")
+        if pts_src:
+            shutil.copy2(pts_src, os.path.join(MODELS_DIR, "actionable_threat_map_points.ply"))
+            shutil.copy2(pts_src, os.path.join(MODELS_DIR, "actionable_threat_map.ply"))
+            deployed.append("point cloud")
+        for name in ("actionable_threat_mesh.ply", "actionable_threat_mesh.obj", "actionable_threat_mesh.glb"):
+            if name in found:
+                shutil.copy2(found[name], os.path.join(MODELS_DIR, name))
+                deployed.append(name.split(".")[-1].upper() + " mesh")
+        if "flight_telemetry.json" in found:
+            shutil.copy2(found["flight_telemetry.json"], os.path.join(DATA_DIR, "flight_telemetry.json"))
+            deployed.append("telemetry")
+        srt = next((found[k] for k in found if k.endswith(".srt")), None)
+        if srt:
+            shutil.copy2(srt, os.path.join(DATA_DIR, "drone_flight.srt"))
+            shutil.copy2(srt, os.path.join(raw_dir, "drone_flight.srt"))
+            deployed.append("SRT log")
+        if "frame_index.json" in found:
+            shutil.copy2(found["frame_index.json"], os.path.join(ws_dir, "frame_index.json"))
+            deployed.append("camera poses")
+        for v in ("drone_flight.mp4", "flight.mp4", "video.mp4"):
+            if v in found:
+                shutil.copy2(found[v], os.path.join(raw_dir, "drone_flight.mp4"))
+                deployed.append("video")
                 break
-
-        # 6. Reports & Visual Previews
-        if "recon_report.json" in extracted_map:
-            shutil.copy2(extracted_map["recon_report.json"], os.path.join(DATA_DIR, "recon_report.json"))
-            deployed.append("recon_report.json")
-        if "preview_topdown.jpg" in extracted_map:
-            shutil.copy2(extracted_map["preview_topdown.jpg"], os.path.join(DATA_DIR, "preview_topdown.jpg"))
-            shutil.copy2(extracted_map["preview_topdown.jpg"], os.path.join(models_dir, "preview_topdown.jpg"))
-            deployed.append("preview_topdown.jpg")
-
-        # Check vertex counts
-        v_count = 0
-        f_count = 0
-        if os.path.exists(pts_target):
+        for name, dst in (("recon_report.json", os.path.join(DATA_DIR, "recon_report.json")),
+                          ("preview_topdown.jpg", os.path.join(MODELS_DIR, "preview_topdown.jpg"))):
+            if name in found:
+                shutil.copy2(found[name], dst)
+        # verify / fix metric scale and orientation with the flight log + camera poses
+        recal = None
+        telem = _read_json(os.path.join(DATA_DIR, "flight_telemetry.json"), {})
+        verified = (telem.get("georeference") or {}).get("status") == "ok" and telem.get("latlon_verified")
+        if not verified:
             try:
-                with open(pts_target, "rb") as f:
-                    for _ in range(40):
-                        line = f.readline().decode("latin1", errors="ignore").strip()
-                        if line.startswith("element vertex"):
-                            v_count = int(line.split()[-1])
-                        elif line == "end_header":
-                            break
-            except Exception:
-                pass
-
-        mesh_target = os.path.join(models_dir, "actionable_threat_mesh.ply")
-        if os.path.exists(mesh_target):
-            try:
-                with open(mesh_target, "rb") as f:
-                    for _ in range(40):
-                        line = f.readline().decode("latin1", errors="ignore").strip()
-                        if line.startswith("element face"):
-                            f_count = int(line.split()[-1])
-                        elif line == "end_header":
-                            break
-            except Exception:
-                pass
-
-        # Update pipeline manager singleton state
+                with _terrain_lock:
+                    recal = RC.recalibrate_active_model(DATA_DIR, force=True, log=pipeline_mgr.add_log)
+                deployed.append("GPS recalibration")
+            except Exception as e:
+                recal = {"status": "skipped", "reason": str(e)}
+        T._MEM.clear()
+        v, _ = plyio.ply_counts(os.path.join(MODELS_DIR, "actionable_threat_map_points.ply"))
+        _, fcount = plyio.ply_counts(os.path.join(MODELS_DIR, "actionable_threat_mesh.ply"))
         with pipeline_mgr.lock:
-            pipeline_mgr.status = "completed"
-            pipeline_mgr.progress_percent = 100
-            pipeline_mgr.current_stage = "COMPLETED"
+            pipeline_mgr.status, pipeline_mgr.progress_percent, pipeline_mgr.current_stage = "completed", 100, "COMPLETED"
             pipeline_mgr.end_time = time.time()
-        pipeline_mgr.add_log(f"Colab Cloud Mission Ingested: {len(deployed)} assets deployed ({v_count:,} points, {f_count:,} mesh faces).")
-
-        return {
-            "success": True,
-            "message": f"Successfully ingested cloud bundle from Colab: {len(deployed)} core assets deployed!",
-            "deployed_files": deployed,
-            "vertex_count": v_count,
-            "face_count": f_count,
-            "has_points": os.path.exists(pts_target),
-            "has_mesh": os.path.exists(mesh_target),
-            "has_video": "drone_flight.mp4" in deployed,
-            "has_telemetry": "flight_telemetry.json" in deployed
-        }
-
+        pipeline_mgr.add_log(f"Cloud bundle deployed: {', '.join(deployed)} ({v:,} points, {fcount:,} mesh faces).")
+        return {"message": f"Deployed {len(deployed)} items from the cloud bundle.", "deployed_files": deployed,
+                "vertex_count": v, "face_count": fcount, "recalibration": recal,
+                "has_video": "video" in deployed, "has_telemetry": "telemetry" in deployed}
     finally:
         shutil.rmtree(extract_dir, ignore_errors=True)
 
 
 @app.post("/api/pipeline/import-colab")
 async def import_colab_bundle(bundle_file: UploadFile = File(...)):
-    """
-    Directly ingests a pre-computed 3D tactical mission package generated on
-    Google Colab / Kaggle. Bypasses local GPU processing completely.
-    """
-    if not (bundle_file.filename and bundle_file.filename.lower().endswith(".zip")):
-        raise HTTPException(status_code=400, detail="Invalid package format. Must be a .ZIP archive generated from Google Colab / Kaggle.")
-
-    temp_zip = os.path.join(UPLOADS_DIR, f"colab_import_{int(time.time())}.zip")
-    with open(temp_zip, "wb") as buffer:
-        shutil.copyfileobj(bundle_file.file, buffer)
-
+    if not (bundle_file.filename or "").lower().endswith(".zip"):
+        raise HTTPException(status_code=400, detail="Choose the prism_colab_bundle.zip produced by the Colab notebook.")
+    path = os.path.join(UPLOADS_DIR, "colab_bundle.zip")
+    with open(path, "wb") as buf:
+        shutil.copyfileobj(bundle_file.file, buf, length=16 * 1024 * 1024)
     try:
-        result = deploy_colab_bundle(temp_zip)
-        return result
+        return jr(dict(deploy_colab_bundle(path), success=True))
+    except zipfile.BadZipFile:
+        raise HTTPException(status_code=400, detail="The .zip file is damaged.")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed unpacking Colab mission bundle: {str(e)}")
-    finally:
-        if os.path.exists(temp_zip):
-            try:
-                os.remove(temp_zip)
-            except Exception:
-                pass
-
+        raise HTTPException(status_code=500, detail=f"Could not deploy the bundle: {e}")
 
 
 if __name__ == "__main__":
     import uvicorn
-    print(f" Serving PRISM Tactical Command Center from: {FRONTEND_DIR}")
-    print(f" Serving Data assets from: {DATA_DIR}")
-    print(f" Open your browser at: http://127.0.0.1:8000")
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    port = int(os.environ.get("PORT", "8000"))
+    print(f" PRISM dashboard: http://127.0.0.1:{port}   (frontend: {FRONTEND_DIR})")
+    uvicorn.run(app, host="127.0.0.1", port=port)
