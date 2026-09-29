@@ -1,0 +1,7 @@
+# Keep line endings consistent between Windows and Linux (Colab)
+* text=auto
+*.py text eol=lf
+*.ipynb text eol=lf
+*.sh text eol=lf
+*.png binary
+*.jpg binary
